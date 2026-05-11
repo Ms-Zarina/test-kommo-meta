@@ -101,6 +101,14 @@ app.post("/webhook/test-lead", async (req, res) => {
   }
 });
 
+app.post("/webhook/kommo", async (req, res) => {
+  console.log(JSON.stringify(req.body, null, 2));
+
+  res.json({
+    ok: true
+  });
+});
+
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
 });
