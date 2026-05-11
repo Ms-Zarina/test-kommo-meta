@@ -101,12 +101,21 @@ app.post("/webhook/test-lead", async (req, res) => {
   }
 });
 
-app.post("/webhook/kommo", async (req, res) => {
-  console.log(JSON.stringify(req.body, null, 2));
 
-  res.json({
-    ok: true
-  });
+app.post("/webhook/kommo", async (req, res) => {
+  try {
+    console.log("KOMMO WEBHOOK:");
+    console.log(JSON.stringify(req.body, null, 2));
+
+    res.json({
+      ok: true
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
 });
 
 app.listen(process.env.PORT || 3000, () => {
