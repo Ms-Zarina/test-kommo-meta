@@ -154,7 +154,10 @@ app.post("/webhook/kommo", async (req, res) => {
       leadId: lead.id
     });
 
-    res.json({
+    console.log("META RESULT:");
+    console.log(JSON.stringify(metaResult, null, 2));
+
+    return res.json({
       ok: true,
       sent_to_meta: true,
       lead_id: lead.id,
@@ -162,7 +165,9 @@ app.post("/webhook/kommo", async (req, res) => {
       meta: metaResult
     });
   } catch (error) {
-    res.status(500).json({
+    console.error("KOMMO ERROR:", error.message);
+
+    return res.status(500).json({
       ok: false,
       error: error.message
     });
@@ -176,7 +181,6 @@ const metaResult = await sendMetaEvent({
   leadId: lead.id
 });
 
-console.log("META RESULT:", metaResult);
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
