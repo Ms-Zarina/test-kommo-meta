@@ -169,6 +169,15 @@ app.post("/webhook/kommo", async (req, res) => {
   }
 });
 
+const metaResult = await sendMetaEvent({
+  eventName: "QualifiedLead",
+  email: "test@example.com",
+  phone: "420777777777",
+  leadId: lead.id
+});
+
+console.log("META RESULT:", metaResult);
+
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
 });
