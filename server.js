@@ -120,6 +120,57 @@ app.post("/webhook/kommo", async (req, res) => {
   }
 });
 
+app.post("/webhook/kommo", async (req, res) => {
+  try {
+    console.log("KOMMO WEBHOOK:");
+    console.log(JSON.stringify(req.body, null, 2));
+
+    const lead =
+      req.body?.leads?.status?.[0] ||
+      req.body?.leads?.update?.[0];
+
+    if (!lead) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "No lead data in webhook"
+      });
+    }
+
+    if (String(lead.status_id) !== String(process.env.QUALIFIED_STATUS_ID)) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "Lead status is not target status",
+        lead_id: lead.id,
+        status_id: lead.status_id
+      });
+    }
+
+    const metaResult = await sendMetaEvent({
+      eventName: "QualifiedLead",
+      email: "test@example.com",
+      phone: "420777777777",
+      leadId: lead.id
+    });
+
+    res.json({
+      ok: true,
+      sent_to_meta: true,
+      lead_id: lead.id,
+      status_id: lead.status_id,
+      meta: metaResult
+    });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
 });
+
+
