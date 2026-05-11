@@ -111,9 +111,7 @@ app.post("/webhook/kommo", async (req, res) => {
     console.log("KOMMO WEBHOOK:");
     console.log(JSON.stringify(req.body, null, 2));
 
-    const lead =
-      req.body?.leads?.status?.[0] ||
-      req.body?.leads?.update?.[0];
+    const lead = req.body?.leads?.status?.[0];
 
     if (!lead) {
       return res.json({
