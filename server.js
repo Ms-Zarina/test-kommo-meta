@@ -73,13 +73,13 @@ app.post("/webhook/test-lead", async (req, res) => {
       });
     }
 
-    if (String(status_id) !== String(process.env.QUALIFIED_STATUS_ID)) {
-      return res.json({
-        ok: true,
-        skipped: true,
-        reason: "Lead status is not qualified"
-      });
-    }
+   // TEMP TEST: status filter disabled
+    console.log("Incoming lead:", {
+      lead_id,
+      status_id,
+      email,
+      phone
+    });
 
     const metaResult = await sendMetaEvent({
       eventName: "QualifiedLead",
