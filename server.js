@@ -1,4 +1,6 @@
+
 const express = require("express");
+const axios = require("axios");
 const crypto = require("crypto");
 const cors = require("cors");
 require("dotenv").config();
@@ -55,6 +57,54 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
   }
 
   return result;
+}
+
+
+async function getLeadWithContacts(leadId) {
+  const response = await axios.get(
+    `https://${process.env.KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}?with=contacts`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  return response.data;
+}
+
+async function getContactById(contactId) {
+  const response = await axios.get(
+    `https://${process.env.KOMMO_SUBDOMAIN}.kommo.com/api/v4/contacts/${contactId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  return response.data;
+}
+
+function extractEmailAndPhone(contact) {
+  const fields = contact.custom_fields_values || [];
+
+  let email = null;
+  let phone = null;
+
+  for (const field of fields) {
+    if (field.field_code === "EMAIL") {
+      email = field.values?.[0]?.value || null;
+    }
+
+    if (field.field_code === "PHONE") {
+      phone = field.values?.[0]?.value || null;
+    }
+  }
+
+  return { email, phone };
 }
 
 app.get("/", (req, res) => {
@@ -131,12 +181,45 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
-    const metaResult = await sendMetaEvent({
-      eventName: "QualifiedLead",
-      email: "test@example.com",
-      phone: "420777777777",
-      leadId: lead.id
-    });
+const leadData = await getLeadWithContacts(lead.id);
+
+console.log("LEAD DATA:");
+console.log(JSON.stringify(leadData, null, 2));
+
+const contactId = leadData?._embedded?.contacts?.[0]?.id;
+
+if (!contactId) {
+  return res.json({
+    ok: true,
+    skipped: true,
+    reason: "No contact linked to lead",
+    lead_id: lead.id
+  });
+}
+
+const contactData = await getContactById(contactId);
+
+console.log("CONTACT DATA:");
+console.log(JSON.stringify(contactData, null, 2));
+
+const { email, phone } = extractEmailAndPhone(contactData);
+
+if (!email && !phone) {
+  return res.json({
+    ok: true,
+    skipped: true,
+    reason: "No email or phone in contact",
+    lead_id: lead.id,
+    contact_id: contactId
+  });
+}
+
+const metaResult = await sendMetaEvent({
+  eventName: "QualifiedLead",
+  email,
+  phone,
+  leadId: lead.id
+});
 
     console.log("META RESULT:");
     console.log(JSON.stringify(metaResult, null, 2));
