@@ -158,6 +158,12 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 app.post("/webhook/kommo", async (req, res) => {
   try {
+    console.log("KOMMO ENV CHECK:", {
+    subdomain: process.env.KOMMO_SUBDOMAIN,
+    tokenExists: !!process.env.KOMMO_ACCESS_TOKEN,
+    tokenStart: process.env.KOMMO_ACCESS_TOKEN?.slice(0, 10),
+    tokenLength: process.env.KOMMO_ACCESS_TOKEN?.length
+  });
     console.log("KOMMO WEBHOOK:");
     console.log(JSON.stringify(req.body, null, 2));
 
