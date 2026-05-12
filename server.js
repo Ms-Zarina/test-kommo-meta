@@ -62,7 +62,7 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
 
 async function getLeadWithContacts(leadId) {
   const response = await axios.get(
-    `https://${process.env.KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/${leadId}?with=contacts`,
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}?with=contacts`,
     {
       headers: {
         Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
@@ -76,7 +76,7 @@ async function getLeadWithContacts(leadId) {
 
 async function getContactById(contactId) {
   const response = await axios.get(
-    `https://${process.env.KOMMO_SUBDOMAIN}.kommo.com/api/v4/contacts/${contactId}`,
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/contacts/${contactId}`,
     {
       headers: {
         Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
