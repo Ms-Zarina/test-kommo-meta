@@ -135,8 +135,14 @@ app.post("/webhook/test-lead", async (req, res) => {
       phone
     });
 
+
+    //"status_id": "78215435" успешно реализован
+    // "status_id": "142" thinking
+
+    //"status_id": "78215435",
+    //"status_id": "78215439",
     const metaResult = await sendMetaEvent({
-      eventName: "QualifiedLead",
+      eventName, 
       email,
       phone,
       leadId: lead_id
@@ -169,7 +175,13 @@ app.post("/webhook/kommo", async (req, res) => {
     console.log("KOMMO WEBHOOK:");
     console.log(JSON.stringify(req.body, null, 2));
 
-    const lead = req.body?.leads?.status?.[0];
+    const STATUS_EVENT_MAP = {
+      "ДУМАЕТ_ID": "Lead",
+      "ЗАПИСАН_ID": "QualifiedLead",
+      "УСПЕШНО_РЕАЛИЗОВАН_ID": "Purchase"
+    };
+
+    const lead = req.body?.leads?.status?.[0] || req.body?.leads?.update?.[0];
 
     if (!lead) {
       return res.json({
@@ -179,7 +191,16 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
-    if (String(lead.status_id) !== String(process.env.QUALIFIED_STATUS_ID)) {
+    const eventName = STATUS_EVENT_MAP[String(lead.status_id)];
+
+      if (!eventName) {
+        return res.json({
+          ok: true,
+          skipped: true,
+          reason: "Status not tracked",
+          status_id: lead.status_id
+        });
+      } {
       return res.json({
         ok: true,
         skipped: true,
@@ -188,6 +209,27 @@ app.post("/webhook/kommo", async (req, res) => {
         status_id: lead.status_id
       });
     }
+
+    // if (String(lead.status_id) !== String(process.env.SUCCESSFULLY_STATUS_ID)) {
+    //   return res.json({
+    //     ok: true,
+    //     skipped: true,
+    //     reason: "Lead status is not target status",
+    //     lead_id: lead.id,
+    //     status_id: lead.status_id
+    //   });
+    // }
+
+    // if (String(lead.status_id) !== String(process.env.THINKING_STATUS_ID)) {
+    //   return res.json({
+    //     ok: true,
+    //     skipped: true,
+    //     reason: "Lead status is not target status",
+    //     lead_id: lead.id,
+    //     status_id: lead.status_id
+    //   });
+    // }
+
 
     const eventKey = `${lead.id}_${lead.status_id}`;
 
@@ -236,7 +278,7 @@ if (!email && !phone) {
 }
 
 const metaResult = await sendMetaEvent({
-  eventName: "QualifiedLead",
+  eventName,
   email,
   phone,
   leadId: lead.id
