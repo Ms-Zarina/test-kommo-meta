@@ -329,7 +329,8 @@ if (!email && !phone) {
   });
 }
 
-const eventName = getMetaEventNameByStatus(status_id); 
+  
+
 const metaResult = await sendMetaEvent({
   eventName,
   email,
