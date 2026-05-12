@@ -114,6 +114,8 @@ app.get("/", (req, res) => {
   });
 });
 
+const sentEvents = new Set();
+
 app.post("/webhook/test-lead", async (req, res) => {
   try {
     const { lead_id, status_id, email, phone } = req.body;
@@ -158,12 +160,12 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 app.post("/webhook/kommo", async (req, res) => {
   try {
-    console.log("KOMMO ENV CHECK:", {
-    subdomain: process.env.KOMMO_SUBDOMAIN,
-    tokenExists: !!process.env.KOMMO_ACCESS_TOKEN,
-    tokenStart: process.env.KOMMO_ACCESS_TOKEN?.slice(0, 10),
-    tokenLength: process.env.KOMMO_ACCESS_TOKEN?.length
-  });
+  //   console.log("KOMMO ENV CHECK:", {
+  //   subdomain: process.env.KOMMO_SUBDOMAIN,
+  //   tokenExists: !!process.env.KOMMO_ACCESS_TOKEN,
+  //   tokenStart: process.env.KOMMO_ACCESS_TOKEN?.slice(0, 10),
+  //   tokenLength: process.env.KOMMO_ACCESS_TOKEN?.length
+  // });
     console.log("KOMMO WEBHOOK:");
     console.log(JSON.stringify(req.body, null, 2));
 
@@ -187,9 +189,22 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
-const leadData = await getLeadWithContacts(lead.id);
+    const eventKey = `${lead.id}_${lead.status_id}`;
 
-console.log("LEAD DATA:");
+    if (sentEvents.has(eventKey)) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "Duplicate event skipped",
+        eventKey
+      });
+    }
+
+    sentEvents.add(eventKey);
+
+    const leadData = await getLeadWithContacts(lead.id);
+
+// console.log("LEAD DATA:");
 console.log(JSON.stringify(leadData, null, 2));
 
 const contactId = leadData?._embedded?.contacts?.[0]?.id;
@@ -205,7 +220,7 @@ if (!contactId) {
 
 const contactData = await getContactById(contactId);
 
-console.log("CONTACT DATA:");
+// console.log("CONTACT DATA:");
 console.log(JSON.stringify(contactData, null, 2));
 
 const { email, phone } = extractEmailAndPhone(contactData);
