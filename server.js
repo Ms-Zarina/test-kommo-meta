@@ -7,6 +7,16 @@ require("dotenv").config();
 
 const app = express();
 
+function getMetaEventNameByStatus(statusId) {
+  const map = {
+    [String(process.env.THINKING_STATUS_ID)]: "Lead",
+    [String(process.env.BOOKING_STATUS_ID)]: "QualifiedLead",
+    [String(process.env.SUCCESSFULLY_STATUS_ID)]: "Purchase"
+  };
+
+  return map[String(statusId)] || null;
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -116,6 +126,50 @@ app.get("/", (req, res) => {
 
 const sentEvents = new Set();
 
+// app.post("/webhook/test-lead", async (req, res) => {
+//   try {
+//     const { lead_id, status_id, email, phone } = req.body;
+
+//     if (!email && !phone) {
+//       return res.status(400).json({
+//         ok: false,
+//         error: "email or phone is required"
+//       });
+//     }
+
+//    // TEMP TEST: status filter disabled
+//     console.log("Incoming lead:", {
+//       lead_id,
+//       status_id,
+//       email,
+//       phone
+//     });
+
+
+//     //"status_id": "78215435" успешно реализован
+//     // "status_id": "142" thinking
+
+//     //"status_id": "78215435",
+//     //"status_id": "78215439",
+//     const metaResult = await sendMetaEvent({
+//       eventName, 
+//       email,
+//       phone,
+//       leadId: lead_id
+//     });
+
+//     res.json({
+//       ok: true,
+//       sent_to_meta: true,
+//       meta: metaResult
+//     });
+//   } catch (error) {
+//     res.status(500).json({
+//       ok: false,
+//       error: error.message
+//     });
+//   }
+// });
 app.post("/webhook/test-lead", async (req, res) => {
   try {
     const { lead_id, status_id, email, phone } = req.body;
@@ -127,22 +181,25 @@ app.post("/webhook/test-lead", async (req, res) => {
       });
     }
 
-   // TEMP TEST: status filter disabled
+    const eventName = getMetaEventNameByStatus(status_id);
+
+    if (!eventName) {
+      return res.status(400).json({
+        ok: false,
+        error: "Unknown status"
+      });
+    }
+
     console.log("Incoming lead:", {
       lead_id,
       status_id,
+      eventName,
       email,
       phone
     });
 
-
-    //"status_id": "78215435" успешно реализован
-    // "status_id": "142" thinking
-
-    //"status_id": "78215435",
-    //"status_id": "78215439",
     const metaResult = await sendMetaEvent({
-      eventName, 
+      eventName,
       email,
       phone,
       leadId: lead_id
@@ -163,7 +220,6 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 
 
-
 app.post("/webhook/kommo", async (req, res) => {
   try {
   //   console.log("KOMMO ENV CHECK:", {
@@ -175,11 +231,7 @@ app.post("/webhook/kommo", async (req, res) => {
     console.log("KOMMO WEBHOOK:");
     console.log(JSON.stringify(req.body, null, 2));
 
-    const STATUS_EVENT_MAP = {
-      "ДУМАЕТ_ID": "Lead",
-      "ЗАПИСАН_ID": "QualifiedLead",
-      "УСПЕШНО_РЕАЛИЗОВАН_ID": "Purchase"
-    };
+    
 
     const lead = req.body?.leads?.status?.[0] || req.body?.leads?.update?.[0];
 
@@ -191,7 +243,7 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
-    const eventName = STATUS_EVENT_MAP[String(lead.status_id)];
+    const eventName = getMetaEventNameByStatus(lead.status_id);
 
       if (!eventName) {
         return res.json({
@@ -277,6 +329,7 @@ if (!email && !phone) {
   });
 }
 
+const eventName = getMetaEventNameByStatus(status_id); 
 const metaResult = await sendMetaEvent({
   eventName,
   email,
