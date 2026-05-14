@@ -43,6 +43,8 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
           ph: phone ? [sha256(phone)] : []
         },
         custom_data: {
+          currency: "CZK",
+          value: 1,
           lead_id: leadId || "test_lead",
           source: "backend_test"
         }
