@@ -126,7 +126,7 @@ app.get("/", (req, res) => {
 
 const sentEvents = new Set();
 
-// app.post("/webhook/test-lead", async (req, res) => {
+
 //   try {
 //     const { lead_id, status_id, email, phone } = req.body;
 
@@ -220,20 +220,144 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 
 
-app.post("/webhook/kommo", async (req, res) => {
-  try {
-  //   console.log("KOMMO ENV CHECK:", {
-  //   subdomain: process.env.KOMMO_SUBDOMAIN,
-  //   tokenExists: !!process.env.KOMMO_ACCESS_TOKEN,
-  //   tokenStart: process.env.KOMMO_ACCESS_TOKEN?.slice(0, 10),
-  //   tokenLength: process.env.KOMMO_ACCESS_TOKEN?.length
-  // });
-    console.log("KOMMO WEBHOOK:");
-    console.log(JSON.stringify(req.body, null, 2));
+// app.post("/webhook/kommo", async (req, res) => {
+//   try {
+//   //   console.log("KOMMO ENV CHECK:", {
+//   //   subdomain: process.env.KOMMO_SUBDOMAIN,
+//   //   tokenExists: !!process.env.KOMMO_ACCESS_TOKEN,
+//   //   tokenStart: process.env.KOMMO_ACCESS_TOKEN?.slice(0, 10),
+//   //   tokenLength: process.env.KOMMO_ACCESS_TOKEN?.length
+//   // });
+//     console.log("KOMMO WEBHOOK:");
+//     console.log(JSON.stringify(req.body, null, 2));
 
     
 
-    const lead = req.body?.leads?.status?.[0] || req.body?.leads?.update?.[0];
+//     const lead = req.body?.leads?.status?.[0] || req.body?.leads?.update?.[0];
+   
+
+//     if (!lead) {
+//       return res.json({
+//         ok: true,
+//         skipped: true,
+//         reason: "No lead data in webhook"
+//       });
+//     }
+
+//     const eventName = getMetaEventNameByStatus(lead.status_id);
+
+//       if (!eventName) {
+//         return res.json({
+//           ok: true,
+//           skipped: true,
+//           reason: "Status not tracked",
+//           status_id: lead.status_id
+//         });
+//       } 
+
+//     // if (String(lead.status_id) !== String(process.env.SUCCESSFULLY_STATUS_ID)) {
+//     //   return res.json({
+//     //     ok: true,
+//     //     skipped: true,
+//     //     reason: "Lead status is not target status",
+//     //     lead_id: lead.id,
+//     //     status_id: lead.status_id
+//     //   });
+//     // }
+
+//     // if (String(lead.status_id) !== String(process.env.THINKING_STATUS_ID)) {
+//     //   return res.json({
+//     //     ok: true,
+//     //     skipped: true,
+//     //     reason: "Lead status is not target status",
+//     //     lead_id: lead.id,
+//     //     status_id: lead.status_id
+//     //   });
+//     // }
+
+
+//     const eventKey = `${lead.id}_${lead.status_id}`;
+
+//     if (sentEvents.has(eventKey)) {
+//       return res.json({
+//         ok: true,
+//         skipped: true,
+//         reason: "Duplicate event skipped",
+//         eventKey
+//       });
+//     }
+
+//     sentEvents.add(eventKey);
+
+//     const leadData = await getLeadWithContacts(lead.id);
+
+// // console.log("LEAD DATA:");
+// console.log(JSON.stringify(leadData, null, 2));
+
+// const contactId = leadData?._embedded?.contacts?.[0]?.id;
+
+// if (!contactId) {
+//   return res.json({
+//     ok: true,
+//     skipped: true,
+//     reason: "No contact linked to lead",
+//     lead_id: lead.id
+//   });
+// }
+
+// const contactData = await getContactById(contactId);
+
+// // console.log("CONTACT DATA:");
+// console.log(JSON.stringify(contactData, null, 2));
+
+// const { email, phone } = extractEmailAndPhone(contactData);
+
+// if (!email && !phone) {
+//   return res.json({
+//     ok: true,
+//     skipped: true,
+//     reason: "No email or phone in contact",
+//     lead_id: lead.id,
+//     contact_id: contactId
+//   });
+// }
+
+  
+
+// const metaResult = await sendMetaEvent({
+//   eventName,
+//   email,
+//   phone,
+//   leadId: lead.id
+// });
+
+//     console.log("META RESULT:");
+//     console.log(JSON.stringify(metaResult, null, 2));
+
+//     return res.json({
+//       ok: true,
+//       sent_to_meta: true,
+//       lead_id: lead.id,
+//       status_id: lead.status_id,
+//       meta: metaResult
+//     });
+//   } catch (error) {
+//     console.error("KOMMO ERROR:", error.message);
+
+//     return res.status(500).json({
+//       ok: false,
+//       error: error.message
+//     });
+//   }
+// });
+app.post("/webhook/kommo", async (req, res) => {
+  try {
+    console.log("KOMMO WEBHOOK:");
+    console.log(JSON.stringify(req.body, null, 2));
+
+    const lead =
+      req.body?.leads?.status?.[0] ||
+      req.body?.leads?.update?.[0];
 
     if (!lead) {
       return res.json({
@@ -245,45 +369,17 @@ app.post("/webhook/kommo", async (req, res) => {
 
     const eventName = getMetaEventNameByStatus(lead.status_id);
 
-      if (!eventName) {
-        return res.json({
-          ok: true,
-          skipped: true,
-          reason: "Status not tracked",
-          status_id: lead.status_id
-        });
-      } {
+    if (!eventName) {
       return res.json({
         ok: true,
         skipped: true,
-        reason: "Lead status is not target status",
+        reason: "Status not tracked",
         lead_id: lead.id,
         status_id: lead.status_id
       });
     }
 
-    // if (String(lead.status_id) !== String(process.env.SUCCESSFULLY_STATUS_ID)) {
-    //   return res.json({
-    //     ok: true,
-    //     skipped: true,
-    //     reason: "Lead status is not target status",
-    //     lead_id: lead.id,
-    //     status_id: lead.status_id
-    //   });
-    // }
-
-    // if (String(lead.status_id) !== String(process.env.THINKING_STATUS_ID)) {
-    //   return res.json({
-    //     ok: true,
-    //     skipped: true,
-    //     reason: "Lead status is not target status",
-    //     lead_id: lead.id,
-    //     status_id: lead.status_id
-    //   });
-    // }
-
-
-    const eventKey = `${lead.id}_${lead.status_id}`;
+    const eventKey = `${lead.id}_${lead.status_id}_${eventName}`;
 
     if (sentEvents.has(eventKey)) {
       return res.json({
@@ -297,46 +393,36 @@ app.post("/webhook/kommo", async (req, res) => {
     sentEvents.add(eventKey);
 
     const leadData = await getLeadWithContacts(lead.id);
+    const contactId = leadData?._embedded?.contacts?.[0]?.id;
 
-// console.log("LEAD DATA:");
-console.log(JSON.stringify(leadData, null, 2));
+    if (!contactId) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "No contact linked to lead",
+        lead_id: lead.id
+      });
+    }
 
-const contactId = leadData?._embedded?.contacts?.[0]?.id;
+    const contactData = await getContactById(contactId);
+    const { email, phone } = extractEmailAndPhone(contactData);
 
-if (!contactId) {
-  return res.json({
-    ok: true,
-    skipped: true,
-    reason: "No contact linked to lead",
-    lead_id: lead.id
-  });
-}
+    if (!email && !phone) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "No email or phone in contact",
+        lead_id: lead.id,
+        contact_id: contactId
+      });
+    }
 
-const contactData = await getContactById(contactId);
-
-// console.log("CONTACT DATA:");
-console.log(JSON.stringify(contactData, null, 2));
-
-const { email, phone } = extractEmailAndPhone(contactData);
-
-if (!email && !phone) {
-  return res.json({
-    ok: true,
-    skipped: true,
-    reason: "No email or phone in contact",
-    lead_id: lead.id,
-    contact_id: contactId
-  });
-}
-
-  
-
-const metaResult = await sendMetaEvent({
-  eventName,
-  email,
-  phone,
-  leadId: lead.id
-});
+    const metaResult = await sendMetaEvent({
+      eventName,
+      email,
+      phone,
+      leadId: lead.id
+    });
 
     console.log("META RESULT:");
     console.log(JSON.stringify(metaResult, null, 2));
@@ -346,10 +432,15 @@ const metaResult = await sendMetaEvent({
       sent_to_meta: true,
       lead_id: lead.id,
       status_id: lead.status_id,
+      eventName,
       meta: metaResult
     });
   } catch (error) {
-    console.error("KOMMO ERROR:", error.message);
+    console.error("KOMMO ERROR:", {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data
+    });
 
     return res.status(500).json({
       ok: false,
@@ -357,7 +448,6 @@ const metaResult = await sendMetaEvent({
     });
   }
 });
-
 
 
 
