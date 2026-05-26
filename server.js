@@ -419,6 +419,23 @@ app.post("/altegio/webhook", async (req, res) => {
 
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
 
+    if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
+      const metaResult = await sendMetaEvent({
+        eventName: "Purchase",
+        email: data?.client?.email,
+        phone: data?.client?.phone,
+        leadId: lead.id,
+        value: altegioValue
+      });
+
+      console.log("META PURCHASE FROM ALTEGIO:");
+      console.log(JSON.stringify({
+        lead_id: lead.id,
+        value: altegioValue,
+        meta: metaResult
+      }, null, 2));
+    }
+
     console.log("KOMMO LEAD UPDATED FROM ALTEGIO:");
     console.log(JSON.stringify({
       lead_id: lead.id,
