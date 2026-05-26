@@ -155,6 +155,16 @@ app.post("/webhook/test-lead", async (req, res) => {
       phone
     });
 
+    if (eventName === "Purchase") {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "Purchase is sent from Altegio with real value",
+        lead_id: lead.id,
+        status_id: lead.status_id
+      });
+    }
+
     const metaResult = await sendMetaEvent({
       eventName,
       email,
