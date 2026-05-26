@@ -554,7 +554,7 @@ app.post("/altegio/webhook", async (req, res) => {
 
     let targetStatusId = null;
 
-    if (status === "create") {
+    if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
     }
 
