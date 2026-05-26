@@ -473,11 +473,136 @@ app.post("/meta/webhook", async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
-app.post("/altegio/webhook", async (req, res) => {
-  console.log("ALTEGIO WEBHOOK:");
-  console.log(JSON.stringify(req.body, null, 2));
+function normalizePhone(phone) {
+  return String(phone || "").replace(/\D/g, "");
+}
 
-  return res.status(200).json({ ok: true });
+async function findKommoLeadByPhone(phone) {
+  const normalizedPhone = normalizePhone(phone);
+
+  const response = await axios.get(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads`,
+    {
+      params: {
+        query: normalizedPhone,
+        with: "contacts"
+      },
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  const leads = response.data?._embedded?.leads || [];
+  return leads[0] || null;
+}
+
+async function updateKommoLeadStatus(leadId, statusId) {
+  const response = await axios.patch(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}`,
+    {
+      status_id: Number(statusId)
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+
+  return response.data;
+}
+
+app.post("/altegio/webhook", async (req, res) => {
+  try {
+    console.log("ALTEGIO WEBHOOK:");
+    console.log(JSON.stringify(req.body, null, 2));
+
+    const { resource, status, data } = req.body;
+
+    if (resource !== "record") {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "Not a record event"
+      });
+    }
+
+    const phone = data?.client?.phone;
+
+    if (!phone) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "No client phone in Altegio record"
+      });
+    }
+
+    const lead = await findKommoLeadByPhone(phone);
+
+    if (!lead) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "No Kommo lead found by phone",
+        phone
+      });
+    }
+
+    let targetStatusId = null;
+
+    if (status === "create") {
+      targetStatusId = process.env.BOOKING_STATUS_ID;
+    }
+
+    if (data?.attendance === 1 || data?.visit_attendance === 1) {
+      targetStatusId = process.env.SUCCESSFULLY_STATUS_ID;
+    }
+
+    if (!targetStatusId) {
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "No matching status rule",
+        altegio_status: status,
+        attendance: data?.attendance,
+        visit_attendance: data?.visit_attendance
+      });
+    }
+
+    const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
+
+    console.log("KOMMO LEAD UPDATED FROM ALTEGIO:");
+    console.log(JSON.stringify({
+      lead_id: lead.id,
+      phone,
+      targetStatusId,
+      altegio_record_id: data?.id,
+      altegio_visit_id: data?.visit_id
+    }, null, 2));
+
+    return res.status(200).json({
+      ok: true,
+      synced: true,
+      lead_id: lead.id,
+      targetStatusId,
+      kommo: updatedLead
+    });
+  } catch (error) {
+    console.error("ALTEGIO SYNC ERROR:", {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data
+    });
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
 });
 
 
