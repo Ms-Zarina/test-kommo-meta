@@ -451,6 +451,27 @@ app.post("/webhook/kommo", async (req, res) => {
   }
 });
 
+app.get("/meta/webhook", (req, res) => {
+  const verifyToken = process.env.META_VERIFY_TOKEN;
+
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === verifyToken) {
+    console.log("META WEBHOOK VERIFIED");
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+app.post("/meta/webhook", async (req, res) => {
+  console.log("META LEAD WEBHOOK:");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  return res.status(200).json({ ok: true });
+});
 
 
 app.listen(process.env.PORT || 3000, () => {
