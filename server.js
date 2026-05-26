@@ -571,6 +571,10 @@ app.post("/altegio/webhook", async (req, res) => {
         attendance: data?.attendance,
         visit_attendance: data?.visit_attendance
       });
+
+      if (data?.attendance === -1 || data?.visit_attendance === -1) {
+        targetStatusId = process.env.CLOSED_STATUS_ID;
+      }
     }
 
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
