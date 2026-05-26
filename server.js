@@ -29,7 +29,7 @@ function sha256(value) {
     .digest("hex");
 }
 
-async function sendMetaEvent({ eventName, email, phone, leadId }) {
+async function sendMetaEvent({ eventName, email, phone, leadId, value = 1 }) {
   const url = `https://graph.facebook.com/v20.0/${process.env.META_PIXEL_ID}/events`;
 
   const payload = {
@@ -44,7 +44,7 @@ async function sendMetaEvent({ eventName, email, phone, leadId }) {
         },
         custom_data: {
           currency: "CZK",
-          value: 1,
+          value: Number(value) || 1,
           lead_id: leadId || "test_lead",
           source: "backend_test"
         }
@@ -127,51 +127,6 @@ app.get("/", (req, res) => {
 });
 
 const sentEvents = new Set();
-
-
-//   try {
-//     const { lead_id, status_id, email, phone } = req.body;
-
-//     if (!email && !phone) {
-//       return res.status(400).json({
-//         ok: false,
-//         error: "email or phone is required"
-//       });
-//     }
-
-//    // TEMP TEST: status filter disabled
-//     console.log("Incoming lead:", {
-//       lead_id,
-//       status_id,
-//       email,
-//       phone
-//     });
-
-
-//     //"status_id": "78215435" успешно реализован
-//     // "status_id": "142" thinking
-
-//     //"status_id": "78215435",
-//     //"status_id": "78215439",
-//     const metaResult = await sendMetaEvent({
-//       eventName, 
-//       email,
-//       phone,
-//       leadId: lead_id
-//     });
-
-//     res.json({
-//       ok: true,
-//       sent_to_meta: true,
-//       meta: metaResult
-//     });
-//   } catch (error) {
-//     res.status(500).json({
-//       ok: false,
-//       error: error.message
-//     });
-//   }
-// });
 app.post("/webhook/test-lead", async (req, res) => {
   try {
     const { lead_id, status_id, email, phone } = req.body;
@@ -221,137 +176,6 @@ app.post("/webhook/test-lead", async (req, res) => {
 });
 
 
-
-// app.post("/webhook/kommo", async (req, res) => {
-//   try {
-//   //   console.log("KOMMO ENV CHECK:", {
-//   //   subdomain: process.env.KOMMO_SUBDOMAIN,
-//   //   tokenExists: !!process.env.KOMMO_ACCESS_TOKEN,
-//   //   tokenStart: process.env.KOMMO_ACCESS_TOKEN?.slice(0, 10),
-//   //   tokenLength: process.env.KOMMO_ACCESS_TOKEN?.length
-//   // });
-//     console.log("KOMMO WEBHOOK:");
-//     console.log(JSON.stringify(req.body, null, 2));
-
-    
-
-//     const lead = req.body?.leads?.status?.[0] || req.body?.leads?.update?.[0];
-   
-
-//     if (!lead) {
-//       return res.json({
-//         ok: true,
-//         skipped: true,
-//         reason: "No lead data in webhook"
-//       });
-//     }
-
-//     const eventName = getMetaEventNameByStatus(lead.status_id);
-
-//       if (!eventName) {
-//         return res.json({
-//           ok: true,
-//           skipped: true,
-//           reason: "Status not tracked",
-//           status_id: lead.status_id
-//         });
-//       } 
-
-//     // if (String(lead.status_id) !== String(process.env.SUCCESSFULLY_STATUS_ID)) {
-//     //   return res.json({
-//     //     ok: true,
-//     //     skipped: true,
-//     //     reason: "Lead status is not target status",
-//     //     lead_id: lead.id,
-//     //     status_id: lead.status_id
-//     //   });
-//     // }
-
-//     // if (String(lead.status_id) !== String(process.env.THINKING_STATUS_ID)) {
-//     //   return res.json({
-//     //     ok: true,
-//     //     skipped: true,
-//     //     reason: "Lead status is not target status",
-//     //     lead_id: lead.id,
-//     //     status_id: lead.status_id
-//     //   });
-//     // }
-
-
-//     const eventKey = `${lead.id}_${lead.status_id}`;
-
-//     if (sentEvents.has(eventKey)) {
-//       return res.json({
-//         ok: true,
-//         skipped: true,
-//         reason: "Duplicate event skipped",
-//         eventKey
-//       });
-//     }
-
-//     sentEvents.add(eventKey);
-
-//     const leadData = await getLeadWithContacts(lead.id);
-
-// // console.log("LEAD DATA:");
-// console.log(JSON.stringify(leadData, null, 2));
-
-// const contactId = leadData?._embedded?.contacts?.[0]?.id;
-
-// if (!contactId) {
-//   return res.json({
-//     ok: true,
-//     skipped: true,
-//     reason: "No contact linked to lead",
-//     lead_id: lead.id
-//   });
-// }
-
-// const contactData = await getContactById(contactId);
-
-// // console.log("CONTACT DATA:");
-// console.log(JSON.stringify(contactData, null, 2));
-
-// const { email, phone } = extractEmailAndPhone(contactData);
-
-// if (!email && !phone) {
-//   return res.json({
-//     ok: true,
-//     skipped: true,
-//     reason: "No email or phone in contact",
-//     lead_id: lead.id,
-//     contact_id: contactId
-//   });
-// }
-
-  
-
-// const metaResult = await sendMetaEvent({
-//   eventName,
-//   email,
-//   phone,
-//   leadId: lead.id
-// });
-
-//     console.log("META RESULT:");
-//     console.log(JSON.stringify(metaResult, null, 2));
-
-//     return res.json({
-//       ok: true,
-//       sent_to_meta: true,
-//       lead_id: lead.id,
-//       status_id: lead.status_id,
-//       meta: metaResult
-//     });
-//   } catch (error) {
-//     console.error("KOMMO ERROR:", error.message);
-
-//     return res.status(500).json({
-//       ok: false,
-//       error: error.message
-//     });
-//   }
-// });
 app.post("/webhook/kommo", async (req, res) => {
   try {
     console.log("KOMMO WEBHOOK:");
@@ -516,6 +340,16 @@ async function updateKommoLeadStatus(leadId, statusId) {
   return response.data;
 }
 
+function getAltegioRecordValue(data) {
+  const services = data?.services || [];
+
+  const total = services.reduce((sum, service) => {
+    return sum + Number(service.cost_to_pay || service.cost || 0);
+  }, 0);
+
+  return total || 1;
+}
+
 app.post("/altegio/webhook", async (req, res) => {
   try {
     console.log("ALTEGIO WEBHOOK:");
@@ -554,6 +388,8 @@ app.post("/altegio/webhook", async (req, res) => {
 
     let targetStatusId = null;
 
+    const altegioValue = getAltegioRecordValue(data);
+
     if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
     }
@@ -588,6 +424,7 @@ app.post("/altegio/webhook", async (req, res) => {
       lead_id: lead.id,
       phone,
       targetStatusId,
+      altegioValue,
       altegio_record_id: data?.id,
       altegio_visit_id: data?.visit_id
     }, null, 2));
