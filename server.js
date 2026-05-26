@@ -562,6 +562,10 @@ app.post("/altegio/webhook", async (req, res) => {
       targetStatusId = process.env.SUCCESSFULLY_STATUS_ID;
     }
 
+    if (data?.attendance === -1 || data?.visit_attendance === -1) {
+      targetStatusId = process.env.CLOSED_STATUS_ID;
+    }
+
     if (!targetStatusId) {
       return res.status(200).json({
         ok: true,
