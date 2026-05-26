@@ -473,6 +473,13 @@ app.post("/meta/webhook", async (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
+app.post("/altegio/webhook", async (req, res) => {
+  console.log("ALTEGIO WEBHOOK:");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  return res.status(200).json({ ok: true });
+});
+
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
