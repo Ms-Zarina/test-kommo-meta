@@ -7,6 +7,19 @@ require("dotenv").config();
 
 const app = express();
 
+const ALTEGIO_SERVICE_MAP = {
+  Kontrola: 5685890
+};
+
+const KOMMO_ALTEGIO_FIELDS = {
+  recordId: ["ID Record, Altegio", "Altegio Record ID"],
+  visitId: ["ID Visit, Altegio", "Altegio Visit ID"],
+  datetime: ["Date and time", "Date and Time", "Datetime"],
+  service: ["Service"],
+  staffId: ["Employee, Altegio"],
+  companyId: ["ID Company, Altegio"]
+};
+
 function getMetaEventNameByStatus(statusId) {
   const map = {
     [String(process.env.THINKING_STATUS_ID)]: "Lead",
@@ -247,6 +260,351 @@ function logEnrichedKommoLead(lead) {
   });
 }
 
+function getKommoCustomField(entity, namesOrIds) {
+  const requestedFields = (Array.isArray(namesOrIds) ? namesOrIds : [namesOrIds])
+    .filter(hasValue)
+    .map((field) => String(field).trim().toLowerCase());
+  const fields = entity?.custom_fields_values || [];
+
+  return fields.find((field) => {
+    const aliases = [field.field_id, field.field_name, field.field_code]
+      .filter(hasValue)
+      .map((alias) => String(alias).trim().toLowerCase());
+
+    return aliases.some((alias) => requestedFields.includes(alias));
+  }) || null;
+}
+
+function getKommoCustomFieldValue(entity, namesOrIds) {
+  return getKommoCustomField(entity, namesOrIds)?.values?.[0]?.value ?? null;
+}
+
+function normalizeAltegioDatetime(value) {
+  if (!hasValue(value)) {
+    return null;
+  }
+
+  const textValue = String(value).trim();
+
+  if (/^\d{10}$/.test(textValue)) {
+    return new Date(Number(textValue) * 1000).toISOString();
+  }
+
+  if (/^\d{13}$/.test(textValue)) {
+    return new Date(Number(textValue)).toISOString();
+  }
+
+  return textValue;
+}
+
+function mapKommoServiceToAltegioServiceId(serviceName) {
+  if (!hasValue(serviceName)) {
+    return null;
+  }
+
+  const normalizedName = String(serviceName).trim().toLowerCase();
+  const match = Object.entries(ALTEGIO_SERVICE_MAP)
+    .find(([name]) => name.toLowerCase() === normalizedName);
+
+  return match ? match[1] : null;
+}
+
+function extractKommoBookingData(enrichedLead, contact) {
+  const { email, phone } = extractEmailAndPhone(contact || {});
+  const clientName = contact?.name || "Kommo Client";
+  const serviceName = getKommoCustomFieldValue(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.service
+  );
+  const companyIdValue = getKommoCustomFieldValue(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.companyId
+  );
+  const staffIdValue = getKommoCustomFieldValue(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.staffId
+  );
+
+  return {
+    leadId: enrichedLead?.id,
+    recordId: getKommoCustomFieldValue(
+      enrichedLead,
+      [
+        ...KOMMO_ALTEGIO_FIELDS.recordId,
+        process.env.KOMMO_ALTEGIO_RECORD_FIELD_ID
+      ]
+    ),
+    visitId: getKommoCustomFieldValue(
+      enrichedLead,
+      [
+        ...KOMMO_ALTEGIO_FIELDS.visitId,
+        process.env.KOMMO_ALTEGIO_VISIT_FIELD_ID
+      ]
+    ),
+    phone,
+    name: clientName,
+    email,
+    datetime: normalizeAltegioDatetime(
+      getKommoCustomFieldValue(enrichedLead, KOMMO_ALTEGIO_FIELDS.datetime)
+    ),
+    serviceName,
+    serviceId: mapKommoServiceToAltegioServiceId(serviceName),
+    staffId: Number(staffIdValue || process.env.ALTEGIO_DEFAULT_STAFF_ID) || null,
+    companyId: Number(companyIdValue || process.env.ALTEGIO_COMPANY_ID) || null
+  };
+}
+
+function getAltegioApiHeaders() {
+  return {
+    Authorization: `Bearer ${process.env.ALTEGIO_PARTNER_TOKEN}, User ${process.env.ALTEGIO_USER_TOKEN}`,
+    "Content-Type": "application/json",
+    Accept: "application/vnd.api.v2+json"
+  };
+}
+
+async function createAltegioRecordFromKommo({ bookingData }) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const payload = {
+    staff_id: bookingData.staffId,
+    services: [{ id: bookingData.serviceId }],
+    client: {
+      phone: bookingData.phone,
+      name: bookingData.name
+    },
+    datetime: bookingData.datetime,
+    save_if_busy: false,
+    comment: `Created from Kommo lead ${bookingData.leadId}`,
+    api_id: `kommo_lead_${bookingData.leadId}`
+  };
+
+  if (hasValue(bookingData.email)) {
+    payload.client.email = bookingData.email;
+  }
+
+  const response = await axios.post(
+    `${apiUrl}/api/v1/records/${bookingData.companyId}`,
+    payload,
+    {
+      headers: getAltegioApiHeaders()
+    }
+  );
+  const responseData = response.data?.data;
+  const record = Array.isArray(responseData) ? responseData[0] : responseData;
+
+  if (!record?.id) {
+    throw new Error("Altegio record creation returned no record ID");
+  }
+
+  return {
+    recordId: record.id,
+    visitId: record.visit_id || null,
+    record
+  };
+}
+
+async function getKommoLeadNotes(leadId) {
+  const response = await axios.get(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}/notes`,
+    {
+      params: {
+        limit: 50
+      },
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  return response.data?._embedded?.notes || [];
+}
+
+function hasAltegioSourceNote(notes) {
+  return notes.some((note) => {
+    const text = note?.params?.text || note?.text || "";
+    return String(text).toLowerCase().includes("source: altegio");
+  });
+}
+
+function getKommoFieldId(entity, fieldNames, envFieldId) {
+  const configuredId = Number(envFieldId);
+
+  if (Number.isInteger(configuredId) && configuredId > 0) {
+    return configuredId;
+  }
+
+  return getKommoCustomField(entity, fieldNames)?.field_id || null;
+}
+
+async function saveAltegioRecordIdToKommoLead(
+  leadId,
+  recordId,
+  visitId,
+  enrichedLead
+) {
+  const recordFieldId = getKommoFieldId(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.recordId,
+    process.env.KOMMO_ALTEGIO_RECORD_FIELD_ID
+  );
+  const visitFieldId = getKommoFieldId(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.visitId,
+    process.env.KOMMO_ALTEGIO_VISIT_FIELD_ID
+  );
+  const customFieldsValues = [];
+
+  if (recordFieldId) {
+    customFieldsValues.push({
+      field_id: Number(recordFieldId),
+      values: [{ value: String(recordId) }]
+    });
+  }
+
+  if (visitFieldId && hasValue(visitId)) {
+    customFieldsValues.push({
+      field_id: Number(visitFieldId),
+      values: [{ value: String(visitId) }]
+    });
+  }
+
+  if (!customFieldsValues.length) {
+    console.log("ALTEGIO RECORD ID SAVE SKIPPED - FIELD NOT CONFIGURED", {
+      lead_id: leadId,
+      record_id: recordId,
+      visit_id: visitId
+    });
+    return false;
+  }
+
+  await axios.patch(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}`,
+    {
+      custom_fields_values: customFieldsValues
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+
+  return true;
+}
+
+async function addKommoNoteForAltegioRecord(leadId, recordId, visitId) {
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: [
+            "Source: Kommo",
+            `Altegio Record ID: ${recordId}`,
+            `Altegio Visit ID: ${visitId || "Not specified"}`
+          ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
+async function syncKommoBookingToAltegio(enrichedLead, contact) {
+  const bookingData = extractKommoBookingData(enrichedLead, contact);
+
+  console.log("KOMMO TO ALTEGIO DEBUG", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId,
+    phone: bookingData.phone,
+    datetime: bookingData.datetime,
+    service: bookingData.serviceName,
+    service_id: bookingData.serviceId,
+    staff_id: bookingData.staffId,
+    company_id: bookingData.companyId
+  });
+
+  if (hasValue(bookingData.recordId)) {
+    console.log("ALTEGIO CREATE SKIPPED - RECORD ALREADY EXISTS", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId
+    });
+    return;
+  }
+
+  const notes = await getKommoLeadNotes(bookingData.leadId);
+
+  if (hasAltegioSourceNote(notes)) {
+    console.log("ALTEGIO CREATE SKIPPED - RECORD ALREADY EXISTS", {
+      lead_id: bookingData.leadId,
+      reason: "Source: Altegio note found"
+    });
+    return;
+  }
+
+  const missing = [];
+
+  if (!hasValue(bookingData.phone)) {
+    missing.push("phone");
+  }
+
+  if (!hasValue(bookingData.datetime)) {
+    missing.push("datetime");
+  }
+
+  if (!bookingData.serviceId) {
+    missing.push("service_mapping");
+  }
+
+  if (!bookingData.companyId) {
+    missing.push("company_id");
+  }
+
+  if (!bookingData.staffId) {
+    missing.push("staff_id");
+  }
+
+  if (missing.length) {
+    console.log("ALTEGIO CREATE SKIPPED - MISSING REQUIRED DATA", {
+      lead_id: bookingData.leadId,
+      missing,
+      service: bookingData.serviceName
+    });
+    return;
+  }
+
+  const createdRecord = await createAltegioRecordFromKommo({ bookingData });
+
+  await saveAltegioRecordIdToKommoLead(
+    bookingData.leadId,
+    createdRecord.recordId,
+    createdRecord.visitId,
+    enrichedLead
+  );
+  await addKommoNoteForAltegioRecord(
+    bookingData.leadId,
+    createdRecord.recordId,
+    createdRecord.visitId
+  );
+
+  console.log("ALTEGIO RECORD CREATED FROM KOMMO", {
+    lead_id: bookingData.leadId,
+    record_id: createdRecord.recordId,
+    visit_id: createdRecord.visitId
+  });
+}
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -367,18 +725,24 @@ app.post("/webhook/kommo", async (req, res) => {
 
     console.log("KOMMO EVENT KEY:", eventKey);
 
-    if (sentEvents.has(eventKey)) {
+    const isDuplicateEvent = sentEvents.has(eventKey);
+    const isBookingStatus =
+      String(lead.status_id) === String(process.env.BOOKING_STATUS_ID);
+
+    if (isDuplicateEvent) {
       console.log("DUPLICATE EVENT SKIPPED:", eventKey);
 
-      return res.json({
-        ok: true,
-        skipped: true,
-        reason: "Duplicate event skipped",
-        eventKey
-      });
+      if (!isBookingStatus) {
+        return res.json({
+          ok: true,
+          skipped: true,
+          reason: "Duplicate event skipped",
+          eventKey
+        });
+      }
+    } else {
+      sentEvents.add(eventKey);
     }
-
-    sentEvents.add(eventKey);
 
     console.log("START KOMMO ENRICHMENT:", { lead_id: lead.id });
 
@@ -405,6 +769,26 @@ app.post("/webhook/kommo", async (req, res) => {
       fbc,
       source: attributionSource
     } = getMetaAttribution(enrichedLead, contactData);
+
+    if (isBookingStatus) {
+      try {
+        await syncKommoBookingToAltegio(enrichedLead, contactData);
+      } catch (error) {
+        console.error("KOMMO TO ALTEGIO ERROR:", {
+          message: error.message,
+          lead_id: lead.id
+        });
+      }
+    }
+
+    if (isDuplicateEvent) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "Duplicate event skipped",
+        eventKey
+      });
+    }
 
     if (!email && !phone) {
       return res.json({
@@ -635,6 +1019,23 @@ async function createKommoLeadFromAltegio({ data, contactId, value, statusId }) 
     data?.client?.name ||
     "Altegio Client";
   const price = value > 0 ? Math.round(value) : 0;
+  const customFieldsValues = [];
+  const recordFieldId = Number(process.env.KOMMO_ALTEGIO_RECORD_FIELD_ID);
+  const visitFieldId = Number(process.env.KOMMO_ALTEGIO_VISIT_FIELD_ID);
+
+  if (Number.isInteger(recordFieldId) && recordFieldId > 0 && hasValue(data?.id || data?.record_id)) {
+    customFieldsValues.push({
+      field_id: recordFieldId,
+      values: [{ value: String(data?.id || data?.record_id) }]
+    });
+  }
+
+  if (Number.isInteger(visitFieldId) && visitFieldId > 0 && hasValue(data?.visit_id)) {
+    customFieldsValues.push({
+      field_id: visitFieldId,
+      values: [{ value: String(data.visit_id) }]
+    });
+  }
 
   const response = await axios.post(
     `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads`,
@@ -644,6 +1045,9 @@ async function createKommoLeadFromAltegio({ data, contactId, value, statusId }) 
         status_id: numericStatusId,
         pipeline_id: pipelineId,
         price,
+        ...(customFieldsValues.length
+          ? { custom_fields_values: customFieldsValues }
+          : {}),
         _embedded: {
           contacts: [{ id: Number(contactId) }]
         }
@@ -667,6 +1071,34 @@ async function createKommoLeadFromAltegio({ data, contactId, value, statusId }) 
   await addKommoLeadNoteFromAltegio(lead.id, data);
 
   return lead;
+}
+
+async function markKommoLeadAsSourcedFromAltegio(lead, data) {
+  const recordId = data?.id || data?.record_id;
+
+  if (!hasValue(recordId)) {
+    return;
+  }
+
+  let enrichedLead = lead;
+
+  try {
+    enrichedLead = await getEnrichedKommoLead(lead.id);
+    await saveAltegioRecordIdToKommoLead(
+      lead.id,
+      recordId,
+      data?.visit_id,
+      enrichedLead
+    );
+  } catch (error) {
+    console.error("ALTEGIO KOMMO RECORD ID SAVE ERROR:", {
+      message: error.message,
+      lead_id: lead.id,
+      record_id: recordId
+    });
+  }
+
+  await addKommoLeadNoteFromAltegio(lead.id, data);
 }
 
 async function updateKommoLeadStatus(leadId, statusId) {
@@ -852,6 +1284,10 @@ app.post("/altegio/webhook", async (req, res) => {
       if (data?.attendance === -1 || data?.visit_attendance === -1) {
         targetStatusId = process.env.CLOSED_STATUS_ID;
       }
+    }
+
+    if (String(targetStatusId) === String(process.env.BOOKING_STATUS_ID)) {
+      await markKommoLeadAsSourcedFromAltegio(lead, data);
     }
 
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
