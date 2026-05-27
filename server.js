@@ -514,6 +514,161 @@ async function findKommoLeadByPhone(phone) {
   return leads[0] || null;
 }
 
+async function findKommoContactByPhone(phone) {
+  const normalizedPhone = normalizePhone(phone);
+
+  const response = await axios.get(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/contacts`,
+    {
+      params: {
+        query: normalizedPhone
+      },
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  const contacts = response.data?._embedded?.contacts || [];
+  return contacts[0] || null;
+}
+
+async function createKommoContact({ name, phone, email }) {
+  const customFields = [
+    {
+      field_code: "PHONE",
+      values: [{ value: phone }]
+    }
+  ];
+
+  if (email) {
+    customFields.push({
+      field_code: "EMAIL",
+      values: [{ value: email }]
+    });
+  }
+
+  const response = await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/contacts`,
+    [
+      {
+        name,
+        custom_fields_values: customFields
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+
+  const contact = response.data?._embedded?.contacts?.[0];
+
+  if (!contact?.id) {
+    throw new Error("Kommo contact creation returned no contact ID");
+  }
+
+  return contact;
+}
+
+function getAltegioServiceName(data) {
+  const serviceNames = (data?.services || [])
+    .map((service) => service.title || service.name)
+    .filter(hasValue);
+
+  return serviceNames.join(", ") || "Not specified";
+}
+
+function getAltegioBookingDatetime(data) {
+  return data?.datetime ||
+    data?.date_time ||
+    data?.start_datetime ||
+    data?.start_date ||
+    data?.date ||
+    "Not specified";
+}
+
+async function addKommoLeadNoteFromAltegio(leadId, data) {
+  const noteText = [
+    "Source: Altegio",
+    `Service: ${getAltegioServiceName(data)}`,
+    `Booking datetime: ${getAltegioBookingDatetime(data)}`,
+    `Record ID: ${data?.id || data?.record_id || "Not specified"}`,
+    `Visit ID: ${data?.visit_id || "Not specified"}`
+  ].join("\n");
+
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: noteText
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
+async function createKommoLeadFromAltegio({ data, contactId, value, statusId }) {
+  const pipelineId = Number(process.env.KOMMO_PIPELINE_ID);
+  const numericStatusId = Number(statusId);
+
+  if (!Number.isInteger(pipelineId) || !Number.isInteger(numericStatusId)) {
+    throw new Error("KOMMO_PIPELINE_ID and BOOKING_STATUS_ID are required for lead creation");
+  }
+
+  const clientName =
+    data?.client?.display_name ||
+    data?.client?.name ||
+    "Altegio Client";
+  const price = value > 0 ? Math.round(value) : 0;
+
+  const response = await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads`,
+    [
+      {
+        name: `Altegio booking - ${clientName}`,
+        status_id: numericStatusId,
+        pipeline_id: pipelineId,
+        price,
+        _embedded: {
+          contacts: [{ id: Number(contactId) }]
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+
+  const lead = response.data?._embedded?.leads?.[0];
+
+  if (!lead?.id) {
+    throw new Error("Kommo lead creation returned no lead ID");
+  }
+
+  await addKommoLeadNoteFromAltegio(lead.id, data);
+
+  return lead;
+}
+
 async function updateKommoLeadStatus(leadId, statusId) {
   const response = await axios.patch(
     `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}`,
@@ -598,19 +753,15 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
-    const lead = await findKommoLeadByPhone(phone);
-
-    if (!lead) {
-      return res.status(200).json({
-        ok: true,
-        skipped: true,
-        reason: "No Kommo lead found by phone",
-        phone
-      });
-    }
-
-    let targetStatusId = null;
-
+    const clientName =
+      data?.client?.display_name ||
+      data?.client?.name ||
+      "Altegio Client";
+    const email = data?.client?.email || null;
+    const serviceName = getAltegioServiceName(data);
+    const bookingDatetime = getAltegioBookingDatetime(data);
+    const recordId = data?.id || data?.record_id;
+    const visitId = data?.visit_id;
     const altegioValue = getValidPurchaseValue(data);
 
     console.log("PURCHASE VALUE DEBUG:", {
@@ -622,6 +773,59 @@ app.post("/altegio/webhook", async (req, res) => {
       })),
       calculatedValue: altegioValue
     });
+
+    const lead = await findKommoLeadByPhone(phone);
+
+    if (!lead) {
+      const isBookingCreated =
+        status === "create" ||
+        data?.confirmed === 1;
+
+      if (!isBookingCreated) {
+        return res.status(200).json({
+          ok: true,
+          skipped: true,
+          reason: "No Kommo lead found by phone",
+          phone
+        });
+      }
+
+      const existingContact = await findKommoContactByPhone(phone);
+      const contact = existingContact || await createKommoContact({
+        name: clientName,
+        phone,
+        email
+      });
+      const createdLead = await createKommoLeadFromAltegio({
+        data,
+        contactId: contact.id,
+        value: altegioValue,
+        statusId: process.env.BOOKING_STATUS_ID
+      });
+
+      console.log("KOMMO LEAD CREATED FROM ALTEGIO", {
+        lead_id: createdLead.id,
+        contact_id: contact.id,
+        phone,
+        clientName,
+        service: serviceName,
+        datetime: bookingDatetime,
+        record_id: recordId,
+        visit_id: visitId,
+        value: altegioValue
+      });
+
+      return res.status(200).json({
+        ok: true,
+        created: true,
+        lead_id: createdLead.id,
+        contact_id: contact.id,
+        targetStatusId: process.env.BOOKING_STATUS_ID,
+        kommo: createdLead
+      });
+    }
+
+    let targetStatusId = null;
 
     if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
