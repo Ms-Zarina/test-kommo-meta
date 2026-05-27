@@ -114,10 +114,13 @@ async function sendMetaEvent({
 }
 
 
-async function getLeadWithContacts(leadId) {
+async function getEnrichedKommoLead(leadId) {
   const response = await axios.get(
-    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}?with=contacts`,
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}`,
     {
+      params: {
+        with: "contacts,tags"
+      },
       headers: {
         Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
         Accept: "application/json"
@@ -207,6 +210,41 @@ function extractFbcFromLeadTags(...leads) {
   }
 
   return null;
+}
+
+function getMetaAttribution(enrichedLead, contact) {
+  const leadFields = extractEmailAndPhone(enrichedLead || {});
+  const contactFields = extractEmailAndPhone(contact || {});
+  const fbp = leadFields.fbp || contactFields.fbp || null;
+  const customFieldFbc = leadFields.fbc || contactFields.fbc || null;
+  const tagFbc = customFieldFbc
+    ? null
+    : extractFbcFromLeadTags(enrichedLead);
+
+  return {
+    fbp,
+    fbc: customFieldFbc || tagFbc,
+    source: customFieldFbc
+      ? "custom_field"
+      : tagFbc
+        ? "tag"
+        : fbp
+          ? "custom_field"
+          : null
+  };
+}
+
+function logEnrichedKommoLead(lead) {
+  console.log("ENRICHED KOMMO LEAD", {
+    lead_id: lead?.id,
+    tags: lead?.tags || lead?._embedded?.tags || [],
+    custom_fields: (lead?.custom_fields_values || []).map((field) => ({
+      field_id: field.field_id,
+      field_name: field.field_name,
+      field_code: field.field_code
+    })),
+    contacts: lead?._embedded?.contacts || []
+  });
 }
 
 app.get("/", (req, res) => {
@@ -327,8 +365,9 @@ app.post("/webhook/kommo", async (req, res) => {
 
     sentEvents.add(eventKey);
 
-    const leadData = await getLeadWithContacts(lead.id);
-    const contactId = leadData?._embedded?.contacts?.[0]?.id;
+    const enrichedLead = await getEnrichedKommoLead(lead.id);
+    logEnrichedKommoLead(enrichedLead);
+    const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
 
     if (!contactId) {
       return res.json({
@@ -340,23 +379,12 @@ app.post("/webhook/kommo", async (req, res) => {
     }
 
     const contactData = await getContactById(contactId);
+    const { email, phone } = extractEmailAndPhone(contactData);
     const {
-      email,
-      phone,
       fbp,
-      fbc: customFieldFbc
-    } = extractEmailAndPhone(contactData);
-    const tagFbc = customFieldFbc
-      ? null
-      : extractFbcFromLeadTags(lead, leadData);
-    const fbc = customFieldFbc || tagFbc;
-    const attributionSource = customFieldFbc
-      ? "custom_field"
-      : tagFbc
-        ? "tag"
-        : fbp
-          ? "custom_field"
-          : null;
+      fbc,
+      source: attributionSource
+    } = getMetaAttribution(enrichedLead, contactData);
 
     if (!email && !phone) {
       return res.json({
@@ -564,30 +592,26 @@ app.post("/altegio/webhook", async (req, res) => {
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
 
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
-      let fbp = null;
-      let fbc = null;
-      let attributionSource = null;
-      let leadData = lead;
-      let contactId = lead?._embedded?.contacts?.[0]?.id;
-      let tagFbc = extractFbcFromLeadTags(lead);
+      let enrichedLead = lead;
+      let contactData = null;
 
-      if (!contactId || !tagFbc) {
-        try {
-          leadData = await getLeadWithContacts(lead.id);
-          contactId = contactId || leadData?._embedded?.contacts?.[0]?.id;
-          tagFbc = tagFbc || extractFbcFromLeadTags(leadData);
-        } catch (error) {
-          console.error("ALTEGIO META MATCH DATA ERROR:", {
-            message: error.message,
-            lead_id: lead.id
-          });
-        }
+      try {
+        enrichedLead = await getEnrichedKommoLead(lead.id);
+        logEnrichedKommoLead(enrichedLead);
+      } catch (error) {
+        console.error("ALTEGIO META MATCH DATA ERROR:", {
+          message: error.message,
+          lead_id: lead.id
+        });
       }
+
+      const contactId =
+        enrichedLead?._embedded?.contacts?.[0]?.id ||
+        lead?._embedded?.contacts?.[0]?.id;
 
       try {
         if (contactId) {
-          const contactData = await getContactById(contactId);
-          ({ fbp, fbc } = extractEmailAndPhone(contactData));
+          contactData = await getContactById(contactId);
         }
       } catch (error) {
         console.error("ALTEGIO META MATCH DATA ERROR:", {
@@ -596,14 +620,11 @@ app.post("/altegio/webhook", async (req, res) => {
         });
       }
 
-      if (fbp || fbc) {
-        attributionSource = "custom_field";
-      }
-
-      if (!fbc && tagFbc) {
-        fbc = tagFbc;
-        attributionSource = "tag";
-      }
+      const {
+        fbp,
+        fbc,
+        source: attributionSource
+      } = getMetaAttribution(enrichedLead, contactData);
 
       if (fbp || fbc) {
         console.log("EXTRACTED META ATTRIBUTION", {
