@@ -40,7 +40,8 @@ async function sendMetaEvent({ eventName, email, phone, leadId, value = 1 }) {
         action_source: "system_generated",
         user_data: {
           em: email ? [sha256(email)] : [],
-          ph: phone ? [sha256(phone)] : []
+          ph: phone ? [sha256(phone)] : [],
+          external_id: leadId ? [sha256(String(leadId))] : []
         },
         custom_data: {
           currency: "CZK",
