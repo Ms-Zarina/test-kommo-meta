@@ -406,9 +406,54 @@ function getAltegioApiHeaders() {
   };
 }
 
+function maskSecret(value) {
+  if (!hasValue(value)) {
+    return "<missing>";
+  }
+
+  const secret = String(value);
+
+  if (secret.length <= 6) {
+    return `${secret.slice(0, 1)}***${secret.slice(-1)}`;
+  }
+
+  return `${secret.slice(0, 4)}...${secret.slice(-4)}`;
+}
+
+function maskAltegioTokens(value) {
+  const tokens = [
+    process.env.ALTEGIO_PARTNER_TOKEN,
+    process.env.ALTEGIO_USER_TOKEN
+  ].filter(hasValue);
+
+  if (typeof value === "string") {
+    return tokens.reduce(
+      (maskedValue, token) =>
+        maskedValue.replaceAll(String(token), maskSecret(token)),
+      value
+    );
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => maskAltegioTokens(item));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        maskAltegioTokens(item)
+      ])
+    );
+  }
+
+  return value;
+}
+
 async function createAltegioRecordFromKommo({ bookingData }) {
   const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
     .replace(/\/$/, "");
+  const requestUrl = `${apiUrl}/api/v1/records/${bookingData.companyId}`;
   const payload = {
     staff_id: bookingData.staffId,
     services: [{ id: bookingData.serviceId }],
@@ -426,13 +471,38 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     payload.client.email = bookingData.email;
   }
 
-  const response = await axios.post(
-    `${apiUrl}/api/v1/records/${bookingData.companyId}`,
-    payload,
-    {
-      headers: getAltegioApiHeaders()
-    }
+  const requestConfig = {
+    headers: getAltegioApiHeaders()
+  };
+
+  console.log("ALTEGIO REQUEST URL:", requestUrl);
+  console.log(
+    "ALTEGIO REQUEST HEADERS:",
+    maskAltegioTokens(requestConfig.headers)
   );
+  console.log("ALTEGIO AXIOS AUTH CONFIG:", {
+    method: "POST",
+    url: requestUrl,
+    ...maskAltegioTokens(requestConfig),
+    authorization_format: "Bearer <PARTNER_TOKEN>, User <USER_TOKEN>",
+    partner_header_required: false,
+    auth_reference: "Altegio OpenAPI BearerPartnerUser"
+  });
+
+  let response;
+
+  try {
+    response = await axios.post(requestUrl, payload, requestConfig);
+  } catch (error) {
+    console.error("ALTEGIO RESPONSE ERROR:", {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: maskAltegioTokens(error.response?.data),
+      headers: maskAltegioTokens(error.response?.headers)
+    });
+    throw error;
+  }
+
   const responseData = response.data?.data;
   const record = Array.isArray(responseData) ? responseData[0] : responseData;
 
