@@ -175,6 +175,40 @@ function extractEmailAndPhone(contact) {
   return { email, phone, fbp, fbc };
 }
 
+function extractFbcFromLeadTags(...leads) {
+  for (const lead of leads) {
+    const tags = [
+      ...(Array.isArray(lead?.tags) ? lead.tags : []),
+      ...(Array.isArray(lead?._embedded?.tags) ? lead._embedded.tags : [])
+    ];
+
+    for (const tag of tags) {
+      const value = typeof tag === "string"
+        ? tag
+        : tag?.name || tag?.value;
+
+      if (!hasValue(value)) {
+        continue;
+      }
+
+      const trimmedValue = String(value).trim();
+      const normalizedValue = trimmedValue.toLowerCase();
+
+      if (
+        normalizedValue.startsWith("fb") ||
+        normalizedValue.startsWith("fbclid") ||
+        normalizedValue.startsWith("fbc")
+      ) {
+        return normalizedValue.startsWith("fb.")
+          ? trimmedValue
+          : `fb.1.${Date.now()}.${trimmedValue}`;
+      }
+    }
+  }
+
+  return null;
+}
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -306,7 +340,23 @@ app.post("/webhook/kommo", async (req, res) => {
     }
 
     const contactData = await getContactById(contactId);
-    const { email, phone, fbp, fbc } = extractEmailAndPhone(contactData);
+    const {
+      email,
+      phone,
+      fbp,
+      fbc: customFieldFbc
+    } = extractEmailAndPhone(contactData);
+    const tagFbc = customFieldFbc
+      ? null
+      : extractFbcFromLeadTags(lead, leadData);
+    const fbc = customFieldFbc || tagFbc;
+    const attributionSource = customFieldFbc
+      ? "custom_field"
+      : tagFbc
+        ? "tag"
+        : fbp
+          ? "custom_field"
+          : null;
 
     if (!email && !phone) {
       return res.json({
@@ -315,6 +365,14 @@ app.post("/webhook/kommo", async (req, res) => {
         reason: "No email or phone in contact",
         lead_id: lead.id,
         contact_id: contactId
+      });
+    }
+
+    if (fbp || fbc) {
+      console.log("EXTRACTED META ATTRIBUTION", {
+        fbp,
+        fbc,
+        source: attributionSource
       });
     }
 
@@ -508,14 +566,25 @@ app.post("/altegio/webhook", async (req, res) => {
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
       let fbp = null;
       let fbc = null;
+      let attributionSource = null;
+      let leadData = lead;
       let contactId = lead?._embedded?.contacts?.[0]?.id;
+      let tagFbc = extractFbcFromLeadTags(lead);
+
+      if (!contactId || !tagFbc) {
+        try {
+          leadData = await getLeadWithContacts(lead.id);
+          contactId = contactId || leadData?._embedded?.contacts?.[0]?.id;
+          tagFbc = tagFbc || extractFbcFromLeadTags(leadData);
+        } catch (error) {
+          console.error("ALTEGIO META MATCH DATA ERROR:", {
+            message: error.message,
+            lead_id: lead.id
+          });
+        }
+      }
 
       try {
-        if (!contactId) {
-          const leadData = await getLeadWithContacts(lead.id);
-          contactId = leadData?._embedded?.contacts?.[0]?.id;
-        }
-
         if (contactId) {
           const contactData = await getContactById(contactId);
           ({ fbp, fbc } = extractEmailAndPhone(contactData));
@@ -524,6 +593,23 @@ app.post("/altegio/webhook", async (req, res) => {
         console.error("ALTEGIO META MATCH DATA ERROR:", {
           message: error.message,
           contact_id: contactId
+        });
+      }
+
+      if (fbp || fbc) {
+        attributionSource = "custom_field";
+      }
+
+      if (!fbc && tagFbc) {
+        fbc = tagFbc;
+        attributionSource = "tag";
+      }
+
+      if (fbp || fbc) {
+        console.log("EXTRACTED META ATTRIBUTION", {
+          fbp,
+          fbc,
+          source: attributionSource
         });
       }
 
