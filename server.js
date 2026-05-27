@@ -29,16 +29,53 @@ function sha256(value) {
     .digest("hex");
 }
 
-  async function sendMetaEvent({
-    eventName,
-    email,
-    phone,
-    leadId,
-    value = 1,
-    ip,
-    userAgent
-  }) {
+function hasValue(value) {
+  return value !== null &&
+    value !== undefined &&
+    String(value).trim() !== "";
+}
+
+async function sendMetaEvent({
+  eventName,
+  email,
+  phone,
+  leadId,
+  value = 1,
+  ip,
+  userAgent,
+  fbp,
+  fbc
+}) {
   const url = `https://graph.facebook.com/v20.0/${process.env.META_PIXEL_ID}/events`;
+  const userData = {};
+
+  if (hasValue(email)) {
+    userData.em = [sha256(email)];
+  }
+
+  if (hasValue(phone)) {
+    userData.ph = [sha256(phone)];
+  }
+
+  if (hasValue(leadId)) {
+    userData.external_id = [sha256(String(leadId))];
+  }
+
+  if (hasValue(ip)) {
+    userData.client_ip_address = ip;
+  }
+
+  if (hasValue(userAgent)) {
+    userData.client_user_agent = userAgent;
+  }
+
+  if (hasValue(fbp)) {
+    userData.fbp = fbp;
+  }
+
+  if (hasValue(fbc)) {
+    userData.fbc = fbc;
+  }
 
   const payload = {
     data: [
@@ -46,13 +83,7 @@ function sha256(value) {
         event_name: eventName,
         event_time: Math.floor(Date.now() / 1000),
         action_source: "system_generated",
-        user_data: {
-          em: email ? [sha256(email)] : [],
-          ph: phone ? [sha256(phone)] : [],
-          external_id: leadId ? [sha256(String(leadId))] : [],
-          client_ip_address: ip || "",
-          client_user_agent: userAgent || ""
-        },
+        user_data: userData,
         custom_data: {
           currency: "CZK",
           value: Number(value) || 1,
@@ -116,6 +147,8 @@ function extractEmailAndPhone(contact) {
 
   let email = null;
   let phone = null;
+  let fbp = null;
+  let fbc = null;
 
   for (const field of fields) {
     if (field.field_code === "EMAIL") {
@@ -125,9 +158,21 @@ function extractEmailAndPhone(contact) {
     if (field.field_code === "PHONE") {
       phone = field.values?.[0]?.value || null;
     }
+
+    const fieldNames = [field.field_code, field.field_name]
+      .filter(Boolean)
+      .map((name) => String(name).toLowerCase().replace(/^_/, ""));
+
+    if (fieldNames.includes("fbp")) {
+      fbp = field.values?.[0]?.value || null;
+    }
+
+    if (fieldNames.includes("fbc")) {
+      fbc = field.values?.[0]?.value || null;
+    }
   }
 
-  return { email, phone };
+  return { email, phone, fbp, fbc };
 }
 
 app.get("/", (req, res) => {
@@ -261,7 +306,7 @@ app.post("/webhook/kommo", async (req, res) => {
     }
 
     const contactData = await getContactById(contactId);
-    const { email, phone } = extractEmailAndPhone(contactData);
+    const { email, phone, fbp, fbc } = extractEmailAndPhone(contactData);
 
     if (!email && !phone) {
       return res.json({
@@ -286,7 +331,9 @@ app.post("/webhook/kommo", async (req, res) => {
       phone,
       leadId: lead.id,
       ip,
-      userAgent
+      userAgent,
+      fbp,
+      fbc
     });
 
     console.log("META RESULT:");
@@ -459,6 +506,27 @@ app.post("/altegio/webhook", async (req, res) => {
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
 
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
+      let fbp = null;
+      let fbc = null;
+      let contactId = lead?._embedded?.contacts?.[0]?.id;
+
+      try {
+        if (!contactId) {
+          const leadData = await getLeadWithContacts(lead.id);
+          contactId = leadData?._embedded?.contacts?.[0]?.id;
+        }
+
+        if (contactId) {
+          const contactData = await getContactById(contactId);
+          ({ fbp, fbc } = extractEmailAndPhone(contactData));
+        }
+      } catch (error) {
+        console.error("ALTEGIO META MATCH DATA ERROR:", {
+          message: error.message,
+          contact_id: contactId
+        });
+      }
+
       const ip =
         req.headers["x-forwarded-for"] ||
         req.socket.remoteAddress;
@@ -473,7 +541,9 @@ app.post("/altegio/webhook", async (req, res) => {
         leadId: lead.id,
         value: altegioValue,
         ip,
-        userAgent
+        userAgent,
+        fbp,
+        fbc
       });
 
       console.log("META PURCHASE FROM ALTEGIO:");
