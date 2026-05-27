@@ -14,8 +14,8 @@ const ALTEGIO_SERVICE_MAP = {
 const KOMMO_ALTEGIO_FIELDS = {
   recordId: ["ID Record, Altegio", "Altegio Record ID"],
   visitId: ["ID Visit, Altegio", "Altegio Visit ID"],
-  datetime: ["Date and time", "Date and Time", "Datetime"],
-  service: ["Service"],
+  datetime: ["Date and time", "Date and Time", "Datetime", "DATE_AND_TIME", "DATETIME"],
+  service: ["Service", "SERVICE"],
   staffId: ["Employee, Altegio"],
   companyId: ["ID Company, Altegio"]
 };
@@ -263,15 +263,34 @@ function logEnrichedKommoLead(lead) {
 function getKommoCustomField(entity, namesOrIds) {
   const requestedFields = (Array.isArray(namesOrIds) ? namesOrIds : [namesOrIds])
     .filter(hasValue)
-    .map((field) => String(field).trim().toLowerCase());
+    .map((field) => String(field).trim());
   const fields = entity?.custom_fields_values || [];
+
+  const fieldNameMatch = fields.find((field) =>
+    requestedFields.some((requestedField) => field.field_name === requestedField)
+  );
+
+  if (fieldNameMatch) {
+    return fieldNameMatch;
+  }
+
+  const fieldCodeMatch = fields.find((field) =>
+    requestedFields.some((requestedField) => field.field_code === requestedField)
+  );
+
+  if (fieldCodeMatch) {
+    return fieldCodeMatch;
+  }
+
+  const normalizedRequestedFields = requestedFields
+    .map((field) => field.toLowerCase());
 
   return fields.find((field) => {
     const aliases = [field.field_id, field.field_name, field.field_code]
       .filter(hasValue)
       .map((alias) => String(alias).trim().toLowerCase());
 
-    return aliases.some((alias) => requestedFields.includes(alias));
+    return aliases.some((alias) => normalizedRequestedFields.includes(alias));
   }) || null;
 }
 
@@ -312,10 +331,17 @@ function mapKommoServiceToAltegioServiceId(serviceName) {
 function extractKommoBookingData(enrichedLead, contact) {
   const { email, phone } = extractEmailAndPhone(contact || {});
   const clientName = contact?.name || "Kommo Client";
-  const serviceName = getKommoCustomFieldValue(
+  const datetimeField = getKommoCustomField(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.datetime
+  );
+  const serviceField = getKommoCustomField(
     enrichedLead,
     KOMMO_ALTEGIO_FIELDS.service
   );
+  const rawDatetime = datetimeField?.values?.[0]?.value ?? null;
+  const datetime = normalizeAltegioDatetime(rawDatetime);
+  const serviceName = serviceField?.values?.[0]?.value ?? null;
   const companyIdValue = getKommoCustomFieldValue(
     enrichedLead,
     KOMMO_ALTEGIO_FIELDS.companyId
@@ -324,6 +350,26 @@ function extractKommoBookingData(enrichedLead, contact) {
     enrichedLead,
     KOMMO_ALTEGIO_FIELDS.staffId
   );
+
+  console.log("KOMMO BOOKING EXTRACTED VALUES", {
+    lead_id: enrichedLead?.id,
+    datetime_field: datetimeField
+      ? {
+          field_name: datetimeField.field_name,
+          field_code: datetimeField.field_code,
+          value: rawDatetime
+        }
+      : null,
+    service_field: serviceField
+      ? {
+          field_name: serviceField.field_name,
+          field_code: serviceField.field_code,
+          value: serviceName
+        }
+      : null,
+    datetime,
+    service: serviceName
+  });
 
   return {
     leadId: enrichedLead?.id,
@@ -344,9 +390,7 @@ function extractKommoBookingData(enrichedLead, contact) {
     phone,
     name: clientName,
     email,
-    datetime: normalizeAltegioDatetime(
-      getKommoCustomFieldValue(enrichedLead, KOMMO_ALTEGIO_FIELDS.datetime)
-    ),
+    datetime,
     serviceName,
     serviceId: mapKommoServiceToAltegioServiceId(serviceName),
     staffId: Number(staffIdValue || process.env.ALTEGIO_DEFAULT_STAFF_ID) || null,
