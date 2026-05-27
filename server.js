@@ -536,10 +536,41 @@ function getAltegioRecordValue(data) {
   const services = data?.services || [];
 
   const total = services.reduce((sum, service) => {
-    return sum + Number(service.cost_to_pay || service.cost || 0);
+    const rawPrice = hasValue(service.cost_to_pay)
+      ? service.cost_to_pay
+      : service.cost;
+    const price = Number(rawPrice ?? 0);
+    const amount = service.amount === null || service.amount === undefined
+      ? 1
+      : Number(service.amount);
+
+    if (
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      !Number.isFinite(amount) ||
+      amount <= 0
+    ) {
+      return sum;
+    }
+
+    return sum + price * amount;
   }, 0);
 
-  return total || 1;
+  return total;
+}
+
+function getValidPurchaseValue(data) {
+  const value = getAltegioRecordValue(data);
+
+  if (value > 0) {
+    return value;
+  }
+
+  if (process.env.ALLOW_TEST_PURCHASE_FALLBACK === "true") {
+    return 1;
+  }
+
+  return null;
 }
 
 app.post("/altegio/webhook", async (req, res) => {
@@ -580,7 +611,17 @@ app.post("/altegio/webhook", async (req, res) => {
 
     let targetStatusId = null;
 
-    const altegioValue = getAltegioRecordValue(data);
+    const altegioValue = getValidPurchaseValue(data);
+
+    console.log("PURCHASE VALUE DEBUG:", {
+      services: data?.services?.map((service) => ({
+        title: service.title,
+        cost_to_pay: service.cost_to_pay,
+        cost: service.cost,
+        amount: service.amount
+      })),
+      calculatedValue: altegioValue
+    });
 
     if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
@@ -612,73 +653,80 @@ app.post("/altegio/webhook", async (req, res) => {
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
 
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
-      let enrichedLead = lead;
-      let contactData = null;
-
-      try {
-        enrichedLead = await getEnrichedKommoLead(lead.id);
-        logEnrichedKommoLead(enrichedLead);
-      } catch (error) {
-        console.error("ALTEGIO META MATCH DATA ERROR:", {
-          message: error.message,
-          lead_id: lead.id
+      if (!altegioValue) {
+        console.log("PURCHASE SKIPPED - INVALID VALUE", {
+          lead_id: lead.id,
+          services: data?.services || []
         });
-      }
+      } else {
+        let enrichedLead = lead;
+        let contactData = null;
 
-      const contactId =
-        enrichedLead?._embedded?.contacts?.[0]?.id ||
-        lead?._embedded?.contacts?.[0]?.id;
-
-      try {
-        if (contactId) {
-          contactData = await getContactById(contactId);
+        try {
+          enrichedLead = await getEnrichedKommoLead(lead.id);
+          logEnrichedKommoLead(enrichedLead);
+        } catch (error) {
+          console.error("ALTEGIO META MATCH DATA ERROR:", {
+            message: error.message,
+            lead_id: lead.id
+          });
         }
-      } catch (error) {
-        console.error("ALTEGIO META MATCH DATA ERROR:", {
-          message: error.message,
-          contact_id: contactId
-        });
-      }
 
-      const {
-        fbp,
-        fbc,
-        source: attributionSource
-      } = getMetaAttribution(enrichedLead, contactData);
+        const contactId =
+          enrichedLead?._embedded?.contacts?.[0]?.id ||
+          lead?._embedded?.contacts?.[0]?.id;
 
-      if (fbp || fbc) {
-        console.log("EXTRACTED META ATTRIBUTION", {
+        try {
+          if (contactId) {
+            contactData = await getContactById(contactId);
+          }
+        } catch (error) {
+          console.error("ALTEGIO META MATCH DATA ERROR:", {
+            message: error.message,
+            contact_id: contactId
+          });
+        }
+
+        const {
           fbp,
           fbc,
           source: attributionSource
+        } = getMetaAttribution(enrichedLead, contactData);
+
+        if (fbp || fbc) {
+          console.log("EXTRACTED META ATTRIBUTION", {
+            fbp,
+            fbc,
+            source: attributionSource
+          });
+        }
+
+        const ip =
+          req.headers["x-forwarded-for"] ||
+          req.socket.remoteAddress;
+
+        const userAgent =
+          req.headers["user-agent"];
+
+        const metaResult = await sendMetaEvent({
+          eventName: "Purchase",
+          email: data?.client?.email,
+          phone: data?.client?.phone,
+          leadId: lead.id,
+          value: altegioValue,
+          ip,
+          userAgent,
+          fbp,
+          fbc
         });
+
+        console.log("META PURCHASE FROM ALTEGIO:");
+        console.log(JSON.stringify({
+          lead_id: lead.id,
+          value: altegioValue,
+          meta: metaResult
+        }, null, 2));
       }
-
-      const ip =
-        req.headers["x-forwarded-for"] ||
-        req.socket.remoteAddress;
-
-      const userAgent =
-        req.headers["user-agent"];
-
-      const metaResult = await sendMetaEvent({
-        eventName: "Purchase",
-        email: data?.client?.email,
-        phone: data?.client?.phone,
-        leadId: lead.id,
-        value: altegioValue,
-        ip,
-        userAgent,
-        fbp,
-        fbc
-      });
-
-      console.log("META PURCHASE FROM ALTEGIO:");
-      console.log(JSON.stringify({
-        lead_id: lead.id,
-        value: altegioValue,
-        meta: metaResult
-      }, null, 2));
     }
 
     console.log("KOMMO LEAD UPDATED FROM ALTEGIO:");
