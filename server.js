@@ -400,7 +400,9 @@ function extractKommoBookingData(enrichedLead, contact) {
 
 function getAltegioApiHeaders() {
   return {
-    Authorization: `Bearer ${process.env.ALTEGIO_PARTNER_TOKEN}, User ${process.env.ALTEGIO_USER_TOKEN}`,
+    Authorization: `Bearer ${process.env.ALTEGIO_USER_TOKEN}`,
+    "Partner-Id": process.env.ALTEGIO_PARTNER_ID,
+    "Partner-Token": process.env.ALTEGIO_PARTNER_TOKEN,
     "Content-Type": "application/json",
     Accept: "application/vnd.api.v2+json"
   };
@@ -484,9 +486,9 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     method: "POST",
     url: requestUrl,
     ...maskAltegioTokens(requestConfig),
-    authorization_format: "Bearer <PARTNER_TOKEN>, User <USER_TOKEN>",
-    partner_header_required: false,
-    auth_reference: "Altegio OpenAPI BearerPartnerUser"
+    authorization_format: "Bearer <USER_TOKEN>",
+    partner_id_header: "Partner-Id",
+    partner_token_header: "Partner-Token"
   });
 
   let response;
