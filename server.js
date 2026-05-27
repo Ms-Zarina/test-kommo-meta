@@ -29,7 +29,15 @@ function sha256(value) {
     .digest("hex");
 }
 
-async function sendMetaEvent({ eventName, email, phone, leadId, value = 1 }) {
+  async function sendMetaEvent({
+    eventName,
+    email,
+    phone,
+    leadId,
+    value = 1,
+    ip,
+    userAgent
+  }) {
   const url = `https://graph.facebook.com/v20.0/${process.env.META_PIXEL_ID}/events`;
 
   const payload = {
@@ -41,7 +49,9 @@ async function sendMetaEvent({ eventName, email, phone, leadId, value = 1 }) {
         user_data: {
           em: email ? [sha256(email)] : [],
           ph: phone ? [sha256(phone)] : [],
-          external_id: leadId ? [sha256(String(leadId))] : []
+          external_id: leadId ? [sha256(String(leadId))] : [],
+          client_ip_address: ip || "",
+          client_user_agent: userAgent || ""
         },
         custom_data: {
           currency: "CZK",
@@ -161,16 +171,25 @@ app.post("/webhook/test-lead", async (req, res) => {
         ok: true,
         skipped: true,
         reason: "Purchase is sent from Altegio with real value",
-        lead_id: lead.id,
-        status_id: lead.status_id
+        lead_id,
+        status_id
       });
     }
+
+    const ip =
+      req.headers["x-forwarded-for"] ||
+      req.socket.remoteAddress;
+
+    const userAgent =
+      req.headers["user-agent"];
 
     const metaResult = await sendMetaEvent({
       eventName,
       email,
       phone,
-      leadId: lead_id
+      leadId: lead_id,
+      ip,
+      userAgent
     });
 
     res.json({
@@ -254,11 +273,20 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
+    const ip =
+      req.headers["x-forwarded-for"] ||
+      req.socket.remoteAddress;
+
+    const userAgent =
+      req.headers["user-agent"];
+
     const metaResult = await sendMetaEvent({
       eventName,
       email,
       phone,
-      leadId: lead.id
+      leadId: lead.id,
+      ip,
+      userAgent
     });
 
     console.log("META RESULT:");
@@ -431,12 +459,21 @@ app.post("/altegio/webhook", async (req, res) => {
     const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
 
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
+      const ip =
+        req.headers["x-forwarded-for"] ||
+        req.socket.remoteAddress;
+
+      const userAgent =
+        req.headers["user-agent"];
+
       const metaResult = await sendMetaEvent({
         eventName: "Purchase",
         email: data?.client?.email,
         phone: data?.client?.phone,
         leadId: lead.id,
-        value: altegioValue
+        value: altegioValue,
+        ip,
+        userAgent
       });
 
       console.log("META PURCHASE FROM ALTEGIO:");
