@@ -342,6 +342,17 @@ app.post("/webhook/kommo", async (req, res) => {
 
     const eventName = getMetaEventNameByStatus(lead.status_id);
 
+    console.log("KOMMO EVENT DEBUG:", {
+      lead_id: lead.id,
+      status_id: lead.status_id,
+      eventName,
+      trackedStatuses: {
+        THINKING_STATUS_ID: process.env.THINKING_STATUS_ID,
+        BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
+        SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID
+      }
+    });
+
     if (!eventName) {
       return res.json({
         ok: true,
@@ -354,7 +365,11 @@ app.post("/webhook/kommo", async (req, res) => {
 
     const eventKey = `${lead.id}_${lead.status_id}_${eventName}`;
 
+    console.log("KOMMO EVENT KEY:", eventKey);
+
     if (sentEvents.has(eventKey)) {
+      console.log("DUPLICATE EVENT SKIPPED:", eventKey);
+
       return res.json({
         ok: true,
         skipped: true,
@@ -365,7 +380,12 @@ app.post("/webhook/kommo", async (req, res) => {
 
     sentEvents.add(eventKey);
 
+    console.log("START KOMMO ENRICHMENT:", { lead_id: lead.id });
+
     const enrichedLead = await getEnrichedKommoLead(lead.id);
+
+    console.log("FINISH KOMMO ENRICHMENT:", { lead_id: lead.id });
+
     logEnrichedKommoLead(enrichedLead);
     const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
 
