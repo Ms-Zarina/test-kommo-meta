@@ -11,7 +11,8 @@ const ALTEGIO_SERVICE_MAP = {
   Kontrola: 5685890,
   "Laserová epilace - Brazilská epilace (třísla + intimní partie)": 5398153,
   "Laserová epilace - Podpaží": 5398144,
-  "Laserová epilace - Dolní končetiny (stehna + kolena + lýtka + nárty + prsty)": 5398154
+  "Laserová epilace - Dolní končetiny (stehna + kolena + lýtka + nárty + prsty)": 5398154,
+  "Odstranění výrůstků (nepigmentových névů), bradavic CO2": 5510171
 };
 
 const KOMMO_ALTEGIO_FIELDS = {
