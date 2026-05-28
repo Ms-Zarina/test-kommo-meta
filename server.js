@@ -454,9 +454,12 @@ async function createAltegioRecordFromKommo({ bookingData }) {
   const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
     .replace(/\/$/, "");
   const requestUrl = `${apiUrl}/api/v1/records/${bookingData.companyId}`;
+  const seanceLength = Number(process.env.ALTEGIO_DEFAULT_SEANCE_LENGTH || 900);
   const payload = {
     staff_id: bookingData.staffId,
     services: [{ id: bookingData.serviceId }],
+    seance_length: seanceLength,
+    length: seanceLength,
     client: {
       phone: bookingData.phone,
       name: bookingData.name
