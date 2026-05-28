@@ -813,7 +813,7 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
   const responseData = response.data?.data;
   const record = Array.isArray(responseData) ? responseData[0] : responseData;
 
-  console.log("ALTEGIO RECORD UPDATED FROM KOMMO", {
+  console.log("ALTEGIO RECORD UPDATE FROM KOMMO", {
     lead_id: bookingData.leadId,
     record_id: bookingData.recordId,
     visit_id: record?.visit_id || bookingData.visitId || null,
@@ -862,6 +862,52 @@ function getKommoFieldId(entity, fieldNames, envFieldId) {
   }
 
   return getKommoCustomField(entity, fieldNames)?.field_id || null;
+}
+
+let kommoLeadCustomFieldsCache = null;
+
+async function getKommoLeadCustomFields() {
+  if (kommoLeadCustomFieldsCache) {
+    return kommoLeadCustomFieldsCache;
+  }
+
+  const response = await axios.get(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/custom_fields`,
+    {
+      params: {
+        limit: 250
+      },
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  kommoLeadCustomFieldsCache = response.data?._embedded?.custom_fields || [];
+  return kommoLeadCustomFieldsCache;
+}
+
+async function resolveKommoLeadFieldId(entity, fieldNames, envFieldId) {
+  const entityFieldId = getKommoFieldId(entity, fieldNames, envFieldId);
+
+  if (entityFieldId) {
+    return Number(entityFieldId);
+  }
+
+  const requestedFields = (Array.isArray(fieldNames) ? fieldNames : [fieldNames])
+    .filter(hasValue)
+    .map((field) => String(field).trim().toLowerCase());
+  const fields = await getKommoLeadCustomFields();
+  const matchedField = fields.find((field) => {
+    const aliases = [field.id, field.field_id, field.name, field.code]
+      .filter(hasValue)
+      .map((alias) => String(alias).trim().toLowerCase());
+
+    return aliases.some((alias) => requestedFields.includes(alias));
+  });
+
+  return matchedField?.id || matchedField?.field_id || null;
 }
 
 async function saveAltegioRecordIdToKommoLead(
@@ -1323,6 +1369,67 @@ async function findKommoLeadByPhone(phone) {
   return leads[0] || null;
 }
 
+async function findKommoLeadByAltegioRecord({ recordId, visitId }) {
+  const identifiers = [
+    {
+      type: "record_id",
+      value: recordId,
+      fieldNames: [
+        ...KOMMO_ALTEGIO_FIELDS.recordId,
+        process.env.KOMMO_ALTEGIO_RECORD_FIELD_ID
+      ]
+    },
+    {
+      type: "visit_id",
+      value: visitId,
+      fieldNames: [
+        ...KOMMO_ALTEGIO_FIELDS.visitId,
+        process.env.KOMMO_ALTEGIO_VISIT_FIELD_ID
+      ]
+    }
+  ].filter((identifier) => hasValue(identifier.value));
+
+  for (const identifier of identifiers) {
+    const response = await axios.get(
+      `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads`,
+      {
+        params: {
+          query: String(identifier.value),
+          with: "contacts",
+          limit: 10
+        },
+        headers: {
+          Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+          Accept: "application/json"
+        }
+      }
+    );
+    const leads = response.data?._embedded?.leads || [];
+
+    for (const lead of leads) {
+      const enrichedLead = await getEnrichedKommoLead(lead.id);
+      const fieldValue = getKommoCustomFieldValue(
+        enrichedLead,
+        identifier.fieldNames
+      );
+
+      if (String(fieldValue) === String(identifier.value)) {
+        console.log("DUPLICATE PREVENTED BY RECORD ID", {
+          lead_id: enrichedLead.id,
+          record_id: recordId,
+          visit_id: visitId,
+          matched_by: identifier.type,
+          matched_value: identifier.value
+        });
+
+        return enrichedLead;
+      }
+    }
+  }
+
+  return null;
+}
+
 async function findKommoContactByPhone(phone) {
   const normalizedPhone = normalizePhone(phone);
 
@@ -1399,6 +1506,67 @@ function getAltegioBookingDatetime(data) {
     data?.start_date ||
     data?.date ||
     "Not specified";
+}
+
+function getAltegioRecordId(data) {
+  return data?.id || data?.record_id;
+}
+
+function getAltegioVisitId(data) {
+  return data?.visit_id;
+}
+
+function parsePragueOffsetMinutes(date) {
+  const match = formatDateInPragueTime(date).match(/([+-])(\d{2}):(\d{2})$/);
+
+  if (!match) {
+    return 0;
+  }
+
+  const minutes = Number(match[2]) * 60 + Number(match[3]);
+  return match[1] === "-" ? -minutes : minutes;
+}
+
+function parseAltegioDatetimeForKommo(value) {
+  if (!hasValue(value)) {
+    return null;
+  }
+
+  const textValue = String(value).trim();
+
+  if (/^\d{10}$/.test(textValue)) {
+    return Number(textValue);
+  }
+
+  if (/^\d{13}$/.test(textValue)) {
+    return Math.floor(Number(textValue) / 1000);
+  }
+
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(textValue)) {
+    const parsedTime = Date.parse(textValue);
+    return Number.isNaN(parsedTime) ? null : Math.floor(parsedTime / 1000);
+  }
+
+  const match = textValue.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/
+  );
+
+  if (!match) {
+    const parsedTime = Date.parse(textValue);
+    return Number.isNaN(parsedTime) ? null : Math.floor(parsedTime / 1000);
+  }
+
+  const localUtcTime = Date.UTC(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+    Number(match[6] || 0)
+  );
+  const pragueOffsetMinutes = parsePragueOffsetMinutes(new Date(localUtcTime));
+
+  return Math.floor((localUtcTime - pragueOffsetMinutes * 60000) / 1000);
 }
 
 async function addKommoLeadNoteFromAltegio(leadId, data) {
@@ -1544,6 +1712,132 @@ async function updateKommoLeadStatus(leadId, statusId) {
   return response.data;
 }
 
+async function updateKommoLeadFromAltegio({
+  lead,
+  data,
+  statusId,
+  value
+}) {
+  let enrichedLead = lead;
+
+  try {
+    enrichedLead = await getEnrichedKommoLead(lead.id);
+  } catch (error) {
+    console.error("KOMMO LEAD ENRICH FOR ALTEGIO UPDATE ERROR:", {
+      message: error.message,
+      lead_id: lead.id
+    });
+  }
+
+  const recordId = getAltegioRecordId(data);
+  const visitId = getAltegioVisitId(data);
+  const datetime = getAltegioBookingDatetime(data);
+  const datetimeValue = parseAltegioDatetimeForKommo(datetime);
+  const serviceName = getAltegioServiceName(data);
+  const customFieldsValues = [];
+  const datetimeFieldId = await resolveKommoLeadFieldId(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.datetime,
+    process.env.KOMMO_ALTEGIO_DATETIME_FIELD_ID
+  );
+  const serviceFieldId = await resolveKommoLeadFieldId(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.service,
+    process.env.KOMMO_ALTEGIO_SERVICE_FIELD_ID
+  );
+  const recordFieldId = await resolveKommoLeadFieldId(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.recordId,
+    process.env.KOMMO_ALTEGIO_RECORD_FIELD_ID
+  );
+  const visitFieldId = await resolveKommoLeadFieldId(
+    enrichedLead,
+    KOMMO_ALTEGIO_FIELDS.visitId,
+    process.env.KOMMO_ALTEGIO_VISIT_FIELD_ID
+  );
+
+  if (datetimeFieldId && datetimeValue) {
+    customFieldsValues.push({
+      field_id: Number(datetimeFieldId),
+      values: [{ value: datetimeValue }]
+    });
+  }
+
+  if (serviceFieldId && hasValue(serviceName)) {
+    customFieldsValues.push({
+      field_id: Number(serviceFieldId),
+      values: [{ value: serviceName }]
+    });
+  }
+
+  if (recordFieldId && hasValue(recordId)) {
+    customFieldsValues.push({
+      field_id: Number(recordFieldId),
+      values: [{ value: String(recordId) }]
+    });
+  }
+
+  if (visitFieldId && hasValue(visitId)) {
+    customFieldsValues.push({
+      field_id: Number(visitFieldId),
+      values: [{ value: String(visitId) }]
+    });
+  }
+
+  const payload = {};
+
+  if (statusId) {
+    payload.status_id = Number(statusId);
+  }
+
+  if (Number.isFinite(value)) {
+    payload.price = Math.round(value);
+  }
+
+  if (customFieldsValues.length) {
+    payload.custom_fields_values = customFieldsValues;
+  }
+
+  if (!Object.keys(payload).length) {
+    console.log("KOMMO LEAD UPDATED TIME FROM ALTEGIO", {
+      lead_id: lead.id,
+      skipped: true,
+      reason: "No Kommo fields resolved for Altegio update",
+      record_id: recordId,
+      visit_id: visitId,
+      datetime,
+      service: serviceName
+    });
+    return null;
+  }
+
+  const response = await axios.patch(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${lead.id}`,
+    payload,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+
+  console.log("KOMMO LEAD UPDATED TIME FROM ALTEGIO", {
+    lead_id: lead.id,
+    status_id: statusId || null,
+    datetime,
+    datetime_value: datetimeValue,
+    service: serviceName,
+    record_id: recordId,
+    visit_id: visitId,
+    price: Number.isFinite(value) ? Math.round(value) : null,
+    updated_field_ids: customFieldsValues.map((field) => field.field_id)
+  });
+
+  return response.data;
+}
+
 function getAltegioRecordValue(data) {
   const services = data?.services || [];
 
@@ -1600,13 +1894,15 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
+    const recordId = getAltegioRecordId(data);
+    const visitId = getAltegioVisitId(data);
     const phone = data?.client?.phone;
 
-    if (!phone) {
+    if (!phone && !recordId && !visitId) {
       return res.status(200).json({
         ok: true,
         skipped: true,
-        reason: "No client phone in Altegio record"
+        reason: "No client phone or Altegio record identifiers in Altegio record"
       });
     }
 
@@ -1617,9 +1913,8 @@ app.post("/altegio/webhook", async (req, res) => {
     const email = data?.client?.email || null;
     const serviceName = getAltegioServiceName(data);
     const bookingDatetime = getAltegioBookingDatetime(data);
-    const recordId = data?.id || data?.record_id;
-    const visitId = data?.visit_id;
     const altegioValue = getValidPurchaseValue(data);
+    const budgetValue = getAltegioRecordValue(data);
 
     console.log("PURCHASE VALUE DEBUG:", {
       services: data?.services?.map((service) => ({
@@ -1631,7 +1926,13 @@ app.post("/altegio/webhook", async (req, res) => {
       calculatedValue: altegioValue
     });
 
-    const lead = await findKommoLeadByPhone(phone);
+    const leadByRecord = await findKommoLeadByAltegioRecord({
+      recordId,
+      visitId
+    });
+    const lead = leadByRecord || (phone
+      ? await findKommoLeadByPhone(phone)
+      : null);
 
     if (!lead) {
       const isBookingCreated =
@@ -1642,8 +1943,20 @@ app.post("/altegio/webhook", async (req, res) => {
         return res.status(200).json({
           ok: true,
           skipped: true,
-          reason: "No Kommo lead found by phone",
-          phone
+          reason: "No Kommo lead found by record ID or phone",
+          phone,
+          record_id: recordId,
+          visit_id: visitId
+        });
+      }
+
+      if (!phone) {
+        return res.status(200).json({
+          ok: true,
+          skipped: true,
+          reason: "No client phone for Kommo contact creation",
+          record_id: recordId,
+          visit_id: visitId
         });
       }
 
@@ -1697,25 +2010,36 @@ app.post("/altegio/webhook", async (req, res) => {
     }
 
     if (!targetStatusId) {
-      return res.status(200).json({
-        ok: true,
-        skipped: true,
-        reason: "No matching status rule",
-        altegio_status: status,
-        attendance: data?.attendance,
-        visit_attendance: data?.visit_attendance
+      const updatedLeadWithoutStatus = await updateKommoLeadFromAltegio({
+        lead,
+        data,
+        statusId: null,
+        value: budgetValue
       });
 
-      if (data?.attendance === -1 || data?.visit_attendance === -1) {
-        targetStatusId = process.env.CLOSED_STATUS_ID;
-      }
+      return res.status(200).json({
+        ok: true,
+        synced: true,
+        status_updated: false,
+        reason: "No matching status rule; updated Altegio fields only",
+        lead_id: lead.id,
+        altegio_status: status,
+        attendance: data?.attendance,
+        visit_attendance: data?.visit_attendance,
+        kommo: updatedLeadWithoutStatus
+      });
     }
 
     if (String(targetStatusId) === String(process.env.BOOKING_STATUS_ID)) {
       await markKommoLeadAsSourcedFromAltegio(lead, data);
     }
 
-    const updatedLead = await updateKommoLeadStatus(lead.id, targetStatusId);
+    const updatedLead = await updateKommoLeadFromAltegio({
+      lead,
+      data,
+      statusId: targetStatusId,
+      value: budgetValue
+    });
 
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
       if (!altegioValue) {
