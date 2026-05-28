@@ -260,6 +260,44 @@ function logEnrichedKommoLead(lead) {
   });
 }
 
+function logKommoLeadCustomFieldsDebug(lead) {
+  const customFields = lead?.custom_fields_values || [];
+
+  console.log(
+    "RAW KOMMO ENRICHED LEAD:",
+    JSON.stringify(lead || null, null, 2)
+  );
+  console.log(
+    "KOMMO CUSTOM FIELDS DEBUG:",
+    JSON.stringify(
+      {
+        lead_id: lead?.id,
+        has_custom_fields_values: Array.isArray(lead?.custom_fields_values),
+        custom_fields_count: customFields.length,
+        custom_fields: customFields.map((field) => ({
+          field_id: field.field_id,
+          field_name: field.field_name,
+          field_code: field.field_code,
+          field_type: field.field_type,
+          values: field.values,
+          raw_values: (field.values || []).map((value) => ({
+            value: value?.value,
+            enum_id: value?.enum_id,
+            enum_code: value?.enum_code,
+            value_type: typeof value?.value,
+            raw: value
+          })),
+          raw: field
+        })),
+        embedded_keys: Object.keys(lead?._embedded || {}),
+        embedded_contacts: lead?._embedded?.contacts || []
+      },
+      null,
+      2
+    )
+  );
+}
+
 function getKommoCustomField(entity, namesOrIds) {
   const requestedFields = (Array.isArray(namesOrIds) ? namesOrIds : [namesOrIds])
     .filter(hasValue)
@@ -296,6 +334,50 @@ function getKommoCustomField(entity, namesOrIds) {
 
 function getKommoCustomFieldValue(entity, namesOrIds) {
   return getKommoCustomField(entity, namesOrIds)?.values?.[0]?.value ?? null;
+}
+
+function getKommoCustomFieldMatchDebug(entity, namesOrIds) {
+  const requestedFields = (Array.isArray(namesOrIds) ? namesOrIds : [namesOrIds])
+    .filter(hasValue)
+    .map((field) => String(field).trim());
+  const normalizedRequestedFields = requestedFields
+    .map((field) => field.toLowerCase());
+  const fields = entity?.custom_fields_values || [];
+  const matchedField = getKommoCustomField(entity, namesOrIds);
+
+  return {
+    requested_fields: requestedFields,
+    custom_fields_count: fields.length,
+    matched: matchedField
+      ? {
+          field_id: matchedField.field_id,
+          field_name: matchedField.field_name,
+          field_code: matchedField.field_code,
+          field_type: matchedField.field_type,
+          values: matchedField.values
+        }
+      : null,
+    candidates: fields.map((field) => {
+      const aliases = [field.field_id, field.field_name, field.field_code]
+        .filter(hasValue)
+        .map((alias) => String(alias).trim());
+      const normalizedAliases = aliases
+        .map((alias) => alias.toLowerCase());
+
+      return {
+        field_id: field.field_id,
+        field_name: field.field_name,
+        field_code: field.field_code,
+        field_type: field.field_type,
+        values: field.values,
+        aliases,
+        exact_field_name_match: requestedFields.includes(field.field_name),
+        exact_field_code_match: requestedFields.includes(field.field_code),
+        normalized_alias_match: normalizedAliases
+          .some((alias) => normalizedRequestedFields.includes(alias))
+      };
+    })
+  };
 }
 
 function formatDateInPragueTime(date) {
@@ -407,6 +489,24 @@ function extractKommoBookingData(enrichedLead, contact) {
     datetime,
     service: serviceName
   });
+  console.log(
+    "KOMMO BOOKING FIELD MATCH DEBUG:",
+    JSON.stringify(
+      {
+        lead_id: enrichedLead?.id,
+        datetime_match: getKommoCustomFieldMatchDebug(
+          enrichedLead,
+          KOMMO_ALTEGIO_FIELDS.datetime
+        ),
+        service_match: getKommoCustomFieldMatchDebug(
+          enrichedLead,
+          KOMMO_ALTEGIO_FIELDS.service
+        )
+      },
+      null,
+      2
+    )
+  );
 
   return {
     leadId: enrichedLead?.id,
@@ -912,6 +1012,7 @@ app.post("/webhook/kommo", async (req, res) => {
     console.log("FINISH KOMMO ENRICHMENT:", { lead_id: lead.id });
 
     logEnrichedKommoLead(enrichedLead);
+    logKommoLeadCustomFieldsDebug(enrichedLead);
     const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
 
     if (!contactId) {
