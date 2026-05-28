@@ -1094,13 +1094,29 @@ async function ensureAltegioSlotAvailable({ bookingData, payload, excludeRecordI
     return true;
   }
 
+  await reportAltegioSlotUnavailable(bookingData, {
+    source: "pre_check",
+    date: availability.date,
+    conflicts: availability.conflicts
+  });
+
+  return false;
+}
+
+function isAltegioSlotConflict(error) {
+  return (
+    error?.response?.status === 409 ||
+    error?.response?.data?.meta?.conflict === true
+  );
+}
+
+async function reportAltegioSlotUnavailable(bookingData, details) {
   console.error("ALTEGIO SLOT UNAVAILABLE", {
     lead_id: bookingData.leadId,
     record_id: bookingData.recordId || null,
     staff_id: bookingData.staffId,
     datetime: bookingData.datetime,
-    date: availability.date,
-    conflicts: availability.conflicts
+    ...details
   });
 
   try {
@@ -1111,8 +1127,6 @@ async function ensureAltegioSlotAvailable({ bookingData, payload, excludeRecordI
       message: error.message
     });
   }
-
-  return false;
 }
 
 function maskSecret(value) {
@@ -1200,6 +1214,15 @@ async function createAltegioRecordFromKommo({ bookingData }) {
   try {
     response = await axios.post(requestUrl, payload, requestConfig);
   } catch (error) {
+    if (isAltegioSlotConflict(error)) {
+      await reportAltegioSlotUnavailable(bookingData, {
+        source: "altegio_409",
+        data: maskAltegioTokens(error.response?.data)
+      });
+
+      return { skipped: true, reason: "slot_unavailable" };
+    }
+
     console.error("ALTEGIO RESPONSE ERROR:", {
       status: error.response?.status,
       statusText: error.response?.statusText,
@@ -1261,6 +1284,15 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
   try {
     response = await axios.put(requestUrl, payload, requestConfig);
   } catch (error) {
+    if (isAltegioSlotConflict(error)) {
+      await reportAltegioSlotUnavailable(bookingData, {
+        source: "altegio_409",
+        data: maskAltegioTokens(error.response?.data)
+      });
+
+      return { skipped: true, reason: "slot_unavailable" };
+    }
+
     console.error("ALTEGIO RECORD UPDATE ERROR:", {
       status: error.response?.status,
       statusText: error.response?.statusText,
