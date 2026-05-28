@@ -959,6 +959,162 @@ async function applyAltegioStaffSelection(bookingData) {
   return true;
 }
 
+function extractLocalDateAndMinutes(value) {
+  const text = String(value || "");
+  const dateMatch = text.match(/(\d{4})-(\d{2})-(\d{2})/);
+  const timeMatch = text.match(/[T ](\d{2}):(\d{2})/);
+
+  if (!dateMatch || !timeMatch) {
+    return null;
+  }
+
+  return {
+    date: `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`,
+    minutes: Number(timeMatch[1]) * 60 + Number(timeMatch[2])
+  };
+}
+
+async function checkAltegioSlotAvailability({
+  companyId,
+  staffId,
+  datetime,
+  seanceLength,
+  excludeRecordId
+}) {
+  const selected = extractLocalDateAndMinutes(datetime);
+
+  if (!selected) {
+    return { checked: false, available: true, reason: "unparseable_datetime" };
+  }
+
+  const durationMin = Math.max(1, Math.ceil((Number(seanceLength) || 0) / 60));
+  const selectedStart = selected.minutes;
+  const selectedEnd = selectedStart + durationMin;
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const requestUrl =
+    `${apiUrl}/api/v1/records/${companyId}` +
+    `?staff_id=${staffId}&start_date=${selected.date}&end_date=${selected.date}&count=200`;
+
+  let records = [];
+
+  try {
+    const response = await axios.get(requestUrl, {
+      headers: getAltegioApiHeaders()
+    });
+    const responseData = response.data?.data;
+    records = Array.isArray(responseData) ? responseData : [];
+  } catch (error) {
+    console.error("ALTEGIO SLOT CHECK ERROR", {
+      company_id: companyId,
+      staff_id: staffId,
+      date: selected.date,
+      status: error.response?.status,
+      message: error.message,
+      data: maskAltegioTokens(error.response?.data)
+    });
+
+    // Fail open: let Altegio's save_if_busy guard be the final arbiter.
+    return { checked: false, available: true, reason: "request_error", date: selected.date };
+  }
+
+  const conflicts = [];
+
+  for (const record of records) {
+    if (record?.deleted) {
+      continue;
+    }
+
+    if (String(record?.staff_id) !== String(staffId)) {
+      continue;
+    }
+
+    if (excludeRecordId && String(record?.id) === String(excludeRecordId)) {
+      continue;
+    }
+
+    const recordInfo = extractLocalDateAndMinutes(record?.date || record?.datetime);
+
+    if (!recordInfo || recordInfo.date !== selected.date) {
+      continue;
+    }
+
+    const recordDurationMin = Math.max(
+      1,
+      Math.ceil(
+        ((Number(record?.seance_length) || Number(record?.length) || 0) +
+          (Number(record?.technical_break_duration) || 0)) / 60
+      )
+    );
+    const recordStart = recordInfo.minutes;
+    const recordEnd = recordStart + recordDurationMin;
+
+    if (selectedStart < recordEnd && recordStart < selectedEnd) {
+      conflicts.push({
+        record_id: record?.id,
+        datetime: record?.datetime || record?.date,
+        start_min: recordStart,
+        end_min: recordEnd
+      });
+    }
+  }
+
+  return {
+    checked: true,
+    available: conflicts.length === 0,
+    date: selected.date,
+    selected_start_min: selectedStart,
+    selected_end_min: selectedEnd,
+    duration_min: durationMin,
+    record_count: records.length,
+    conflicts
+  };
+}
+
+async function ensureAltegioSlotAvailable({ bookingData, payload, excludeRecordId }) {
+  const availability = await checkAltegioSlotAvailability({
+    companyId: bookingData.companyId,
+    staffId: bookingData.staffId,
+    datetime: bookingData.datetime,
+    seanceLength: payload.seance_length,
+    excludeRecordId
+  });
+
+  console.log("ALTEGIO SLOT AVAILABILITY DEBUG", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId || null,
+    staff_id: bookingData.staffId,
+    service_ids: payload.services?.map((service) => service.id),
+    datetime: bookingData.datetime,
+    seance_length: payload.seance_length,
+    ...availability
+  });
+
+  if (availability.available) {
+    return true;
+  }
+
+  console.error("ALTEGIO SLOT UNAVAILABLE", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId || null,
+    staff_id: bookingData.staffId,
+    datetime: bookingData.datetime,
+    date: availability.date,
+    conflicts: availability.conflicts
+  });
+
+  try {
+    await addKommoNoteForAltegioSlotUnavailable(bookingData);
+  } catch (error) {
+    console.log("KOMMO SLOT UNAVAILABLE NOTE SKIPPED:", {
+      lead_id: bookingData.leadId,
+      message: error.message
+    });
+  }
+
+  return false;
+}
+
 function maskSecret(value) {
   if (!hasValue(value)) {
     return "<missing>";
@@ -1011,6 +1167,12 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     bookingData,
     includeClient: true
   });
+
+  const slotAvailable = await ensureAltegioSlotAvailable({ bookingData, payload });
+
+  if (!slotAvailable) {
+    return { skipped: true, reason: "slot_unavailable" };
+  }
 
   console.log(
     "ALTEGIO CREATE PAYLOAD:",
@@ -1073,6 +1235,17 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     bookingData,
     includeClient: false
   });
+
+  const slotAvailable = await ensureAltegioSlotAvailable({
+    bookingData,
+    payload,
+    excludeRecordId: bookingData.recordId
+  });
+
+  if (!slotAvailable) {
+    return { skipped: true, reason: "slot_unavailable" };
+  }
+
   const requestConfig = {
     headers: getAltegioApiHeaders()
   };
@@ -1392,6 +1565,33 @@ async function addKommoNoteForAltegioCancel(leadId, recordId, reason) {
   );
 }
 
+async function addKommoNoteForAltegioSlotUnavailable(bookingData) {
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(bookingData.leadId),
+        note_type: "common",
+        params: {
+          text: [
+            "Source: Kommo",
+            "Selected Altegio slot unavailable",
+            `Datetime: ${bookingData.datetime || "Not specified"}`,
+            `Staff ID: ${bookingData.staffId || "Not specified"}`
+          ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
 async function syncKommoCancelToAltegio(lead, { isDeleteEvent, reason }) {
   const leadId = lead?.id;
   let enrichedLead = null;
@@ -1578,6 +1778,14 @@ async function syncKommoExistingRecordUpdateToAltegio(
   });
 
   const updatedRecord = await updateAltegioRecordFromKommo({ bookingData });
+
+  if (updatedRecord?.skipped) {
+    return {
+      updated: false,
+      skipped: true,
+      reason: updatedRecord.reason || "slot_unavailable"
+    };
+  }
 
   return {
     updated: true,
@@ -1860,6 +2068,10 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
   }
 
   const createdRecord = await createAltegioRecordFromKommo({ bookingData });
+
+  if (createdRecord?.skipped) {
+    return;
+  }
 
   await saveAltegioRecordIdToKommoLead(
     bookingData.leadId,
