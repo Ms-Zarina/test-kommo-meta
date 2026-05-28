@@ -543,6 +543,132 @@ function getAltegioApiHeaders() {
   };
 }
 
+function getDefaultAltegioSeanceLength() {
+  return Number(process.env.ALTEGIO_DEFAULT_SEANCE_LENGTH || 900);
+}
+
+async function getAltegioServiceDuration({ companyId, serviceId, staffId }) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const requestUrls = [
+    `${apiUrl}/api/v1/company/${companyId}/services/${serviceId}`,
+    `${apiUrl}/api/v1/services/${companyId}/${serviceId}`
+  ];
+  let duration = null;
+  let source = null;
+  let service = null;
+  const attempts = [];
+
+  for (const requestUrl of requestUrls) {
+    try {
+      const response = await axios.get(requestUrl, {
+        headers: getAltegioApiHeaders()
+      });
+      const responseData = response.data?.data;
+      const services = Array.isArray(responseData) ? responseData : [responseData];
+
+      service = services.find((item) =>
+        String(item?.id) === String(serviceId) ||
+        String(item?.salon_service_id) === String(serviceId)
+      ) || services.find(Boolean) || null;
+
+      attempts.push({
+        request_url: requestUrl,
+        status: response.status,
+        service_found: Boolean(service),
+        service_id: service?.id,
+        salon_service_id: service?.salon_service_id,
+        duration: service?.duration,
+        staff: service?.staff
+      });
+
+      const staffService = (service?.staff || []).find((item) =>
+        String(item?.id) === String(staffId)
+      );
+
+      if (Number(staffService?.seance_length) > 0) {
+        duration = Number(staffService.seance_length);
+        source = "staff_seance_length";
+        break;
+      } else if (Number(service?.duration) > 0) {
+        duration = Number(service.duration);
+        source = "service_duration";
+        break;
+      }
+    } catch (error) {
+      attempts.push({
+        request_url: requestUrl,
+        status: error.response?.status,
+        error: error.message,
+        data: maskAltegioTokens(error.response?.data)
+      });
+      console.error("ALTEGIO SERVICE DURATION ERROR:", {
+        request_url: requestUrl,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: maskAltegioTokens(error.response?.data),
+        message: error.message
+      });
+    }
+  }
+
+  if (!duration) {
+    duration = getDefaultAltegioSeanceLength();
+    source = "fallback_env";
+  }
+
+  console.log("ALTEGIO SERVICE DURATION DEBUG", {
+    company_id: companyId,
+    service_id: serviceId,
+    staff_id: staffId,
+    attempts,
+    duration,
+    source,
+    service: service
+      ? {
+          id: service.id,
+          salon_service_id: service.salon_service_id,
+          title: service.title,
+          duration: service.duration,
+          staff: service.staff
+        }
+      : null
+  });
+
+  return duration;
+}
+
+async function buildAltegioRecordPayload({ bookingData, includeClient }) {
+  const seanceLength = await getAltegioServiceDuration({
+    companyId: bookingData.companyId,
+    serviceId: bookingData.serviceId,
+    staffId: bookingData.staffId
+  });
+  const payload = {
+    staff_id: bookingData.staffId,
+    services: [{ id: bookingData.serviceId }],
+    seance_length: seanceLength,
+    length: seanceLength,
+    datetime: bookingData.datetime,
+    save_if_busy: false,
+    comment: `Created from Kommo lead ${bookingData.leadId}`,
+    api_id: `kommo_lead_${bookingData.leadId}`
+  };
+
+  if (includeClient) {
+    payload.client = {
+      phone: bookingData.phone,
+      name: bookingData.name
+    };
+
+    if (hasValue(bookingData.email)) {
+      payload.client.email = bookingData.email;
+    }
+  }
+
+  return payload;
+}
+
 function maskSecret(value) {
   if (!hasValue(value)) {
     return "<missing>";
@@ -591,25 +717,10 @@ async function createAltegioRecordFromKommo({ bookingData }) {
   const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
     .replace(/\/$/, "");
   const requestUrl = `${apiUrl}/api/v1/records/${bookingData.companyId}`;
-  const seanceLength = Number(process.env.ALTEGIO_DEFAULT_SEANCE_LENGTH || 900);
-  const payload = {
-    staff_id: bookingData.staffId,
-    services: [{ id: bookingData.serviceId }],
-    seance_length: seanceLength,
-    length: seanceLength,
-    client: {
-      phone: bookingData.phone,
-      name: bookingData.name
-    },
-    datetime: bookingData.datetime,
-    save_if_busy: false,
-    comment: `Created from Kommo lead ${bookingData.leadId}`,
-    api_id: `kommo_lead_${bookingData.leadId}`
-  };
-
-  if (hasValue(bookingData.email)) {
-    payload.client.email = bookingData.email;
-  }
+  const payload = await buildAltegioRecordPayload({
+    bookingData,
+    includeClient: true
+  });
 
   console.log(
     "ALTEGIO CREATE PAYLOAD:",
@@ -660,6 +771,61 @@ async function createAltegioRecordFromKommo({ bookingData }) {
   return {
     recordId: record.id,
     visitId: record.visit_id || null,
+    record
+  };
+}
+
+async function updateAltegioRecordFromKommo({ bookingData }) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const requestUrl = `${apiUrl}/api/v1/record/${bookingData.companyId}/${bookingData.recordId}`;
+  const payload = await buildAltegioRecordPayload({
+    bookingData,
+    includeClient: false
+  });
+  const requestConfig = {
+    headers: getAltegioApiHeaders()
+  };
+
+  console.log(
+    "ALTEGIO RECORD UPDATE PAYLOAD",
+    JSON.stringify(payload, null, 2)
+  );
+
+  let response;
+
+  try {
+    response = await axios.put(requestUrl, payload, requestConfig);
+  } catch (error) {
+    console.error("ALTEGIO RECORD UPDATE ERROR:", {
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: maskAltegioTokens(error.response?.data),
+      headers: maskAltegioTokens(error.response?.headers)
+    });
+    console.log(
+      "ALTEGIO RESPONSE ERROR FULL:",
+      JSON.stringify(error.response?.data, null, 2)
+    );
+    throw error;
+  }
+
+  const responseData = response.data?.data;
+  const record = Array.isArray(responseData) ? responseData[0] : responseData;
+
+  console.log("ALTEGIO RECORD UPDATED FROM KOMMO", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId,
+    visit_id: record?.visit_id || bookingData.visitId || null,
+    datetime: bookingData.datetime,
+    service_id: bookingData.serviceId,
+    staff_id: bookingData.staffId,
+    seance_length: payload.seance_length
+  });
+
+  return {
+    recordId: record?.id || bookingData.recordId,
+    visitId: record?.visit_id || bookingData.visitId || null,
     record
   };
 }
@@ -796,27 +962,9 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
     company_id: bookingData.companyId
   });
 
-  if (hasValue(bookingData.recordId)) {
-    console.log("ALTEGIO CREATE SKIPPED - RECORD ALREADY EXISTS", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId
-    });
-    return;
-  }
-
-  const notes = await getKommoLeadNotes(bookingData.leadId);
-
-  if (hasAltegioSourceNote(notes)) {
-    console.log("ALTEGIO CREATE SKIPPED - RECORD ALREADY EXISTS", {
-      lead_id: bookingData.leadId,
-      reason: "Source: Altegio note found"
-    });
-    return;
-  }
-
   const missing = [];
 
-  if (!hasValue(bookingData.phone)) {
+  if (!hasValue(bookingData.recordId) && !hasValue(bookingData.phone)) {
     missing.push("phone");
   }
 
@@ -841,6 +989,21 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
       lead_id: bookingData.leadId,
       missing,
       service: bookingData.serviceName
+    });
+    return;
+  }
+
+  if (hasValue(bookingData.recordId)) {
+    await updateAltegioRecordFromKommo({ bookingData });
+    return;
+  }
+
+  const notes = await getKommoLeadNotes(bookingData.leadId);
+
+  if (hasAltegioSourceNote(notes)) {
+    console.log("ALTEGIO CREATE SKIPPED - RECORD ALREADY EXISTS", {
+      lead_id: bookingData.leadId,
+      reason: "Source: Altegio note found"
     });
     return;
   }
