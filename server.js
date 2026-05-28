@@ -47,8 +47,7 @@ function getKommoCancelStatusIds() {
     ...parseStatusIds(process.env.CLOSED_STATUS_IDS),
     ...parseStatusIds(process.env.CANCELLED_STATUS_IDS),
     ...parseStatusIds(process.env.CANCEL_STATUS_IDS),
-    ...parseStatusIds(process.env.KOMMO_CANCEL_STATUS_IDS),
-    "143"
+    ...parseStatusIds(process.env.KOMMO_CANCEL_STATUS_IDS)
   ]
     .filter(hasValue)
     .map((statusId) => String(statusId));
@@ -66,8 +65,12 @@ function getKommoNoAnswerStatusIds() {
   return [
     process.env.NO_ANSWER_STATUS_ID,
     process.env.KOMMO_NO_ANSWER_STATUS_ID,
+    process.env.NEDOZVON_STATUS_ID,
+    process.env.KOMMO_NEDOZVON_STATUS_ID,
     ...parseStatusIds(process.env.NO_ANSWER_STATUS_IDS),
-    ...parseStatusIds(process.env.KOMMO_NO_ANSWER_STATUS_IDS)
+    ...parseStatusIds(process.env.KOMMO_NO_ANSWER_STATUS_IDS),
+    ...parseStatusIds(process.env.NEDOZVON_STATUS_IDS),
+    ...parseStatusIds(process.env.KOMMO_NEDOZVON_STATUS_IDS)
   ]
     .filter(hasValue)
     .map((statusId) => String(statusId));
@@ -1382,18 +1385,18 @@ async function routeKommoToAltegio({
   const bookingData = extractKommoBookingData(enrichedLead, contact);
   const isBookingStatus =
     String(statusId) === String(process.env.BOOKING_STATUS_ID);
-  const isCancelStatus = isKommoCancelStatus(statusId);
   const isThinkingStatus = isKommoThinkingStatus(statusId);
   const isNoAnswerStatus = isKommoNoAnswerStatus(statusId);
+  const isCancelStatus = !isNoAnswerStatus && isKommoCancelStatus(statusId);
   const route = isBookingStatus
     ? "booking"
-    : isCancelStatus
-      ? "cancel"
-      : isThinkingStatus
+    : isThinkingStatus
         ? "thinking"
         : isNoAnswerStatus
           ? "no_answer"
-          : "no_altegio_action";
+          : isCancelStatus
+            ? "cancel"
+            : "no_altegio_action";
 
   console.log("KOMMO TO ALTEGIO ROUTER START", {
     lead_id: enrichedLead?.id || webhookLead?.id,
@@ -1441,6 +1444,36 @@ async function routeKommoToAltegio({
       route,
       synced: true,
       recordId: bookingData.recordId || null
+    };
+  }
+
+  if (isThinkingStatus || isNoAnswerStatus) {
+    if (isNoAnswerStatus) {
+      console.log("KOMMO NO ANSWER - ALTEGIO RECORD KEPT", {
+        lead_id: bookingData.leadId,
+        status_id: statusId,
+        record_id: bookingData.recordId || null
+      });
+    }
+
+    console.log("KOMMO STATUS DOES NOT REQUIRE ALTEGIO CREATE", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      route,
+      record_id: bookingData.recordId || null
+    });
+    console.log("ALTEGIO STATUS SYNC SKIPPED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      route,
+      reason: "Status does not create or update Altegio appointment"
+    });
+
+    return {
+      route,
+      synced: false,
+      skipped: true,
+      reason: "Status does not require Altegio create"
     };
   }
 
@@ -1499,28 +1532,6 @@ async function routeKommoToAltegio({
       route,
       synced: true,
       recordId: bookingData.recordId
-    };
-  }
-
-  if (isThinkingStatus || isNoAnswerStatus) {
-    console.log("KOMMO STATUS DOES NOT REQUIRE ALTEGIO CREATE", {
-      lead_id: bookingData.leadId,
-      status_id: statusId,
-      route,
-      record_id: bookingData.recordId || null
-    });
-    console.log("ALTEGIO STATUS SYNC SKIPPED", {
-      lead_id: bookingData.leadId,
-      status_id: statusId,
-      route,
-      reason: "Status does not create or update Altegio appointment"
-    });
-
-    return {
-      route,
-      synced: false,
-      skipped: true,
-      reason: "Status does not require Altegio create"
     };
   }
 
@@ -1792,7 +1803,9 @@ app.post("/webhook/kommo", async (req, res) => {
 
     const effectiveStatusId = lead.status_id || enrichedLead?.status_id;
     const eventName = getMetaEventNameByStatus(effectiveStatusId);
-    const isCancelStatus = isKommoCancelStatus(effectiveStatusId);
+    const isNoAnswerStatus = isKommoNoAnswerStatus(effectiveStatusId);
+    const isCancelStatus =
+      !isNoAnswerStatus && isKommoCancelStatus(effectiveStatusId);
 
     console.log("KOMMO EVENT DEBUG:", {
       lead_id: lead.id,
@@ -1801,6 +1814,7 @@ app.post("/webhook/kommo", async (req, res) => {
       status_id: effectiveStatusId,
       eventName,
       isDeleteEvent,
+      isNoAnswerStatus,
       isCancelStatus,
       trackedStatuses: {
         THINKING_STATUS_ID: process.env.THINKING_STATUS_ID,
