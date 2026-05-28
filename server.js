@@ -8,7 +8,10 @@ require("dotenv").config();
 const app = express();
 
 const ALTEGIO_SERVICE_MAP = {
-  Kontrola: 5685890
+  Kontrola: 5685890,
+  "Laserová epilace - Brazilská epilace (třísla + intimní partie)": 5398153,
+  "Laserová epilace - Podpaží": 5398144,
+  "Laserová epilace - Dolní končetiny (stehna + kolena + lýtka + nárty + prsty)": 5398154
 };
 
 const KOMMO_ALTEGIO_FIELDS = {
@@ -550,6 +553,32 @@ function mapKommoServiceToAltegioServiceId(serviceName) {
   return match ? match[1] : null;
 }
 
+function mapKommoServicesToAltegioServiceIds(serviceName) {
+  if (!hasValue(serviceName)) {
+    return { names: [], serviceIds: [], missing: [] };
+  }
+
+  const names = String(serviceName)
+    .split(",")
+    .map((name) => name.trim())
+    .filter(hasValue);
+
+  const serviceIds = [];
+  const missing = [];
+
+  for (const name of names) {
+    const serviceId = mapKommoServiceToAltegioServiceId(name);
+
+    if (serviceId) {
+      serviceIds.push(serviceId);
+    } else {
+      missing.push(name);
+    }
+  }
+
+  return { names, serviceIds, missing };
+}
+
 function extractKommoBookingData(enrichedLead, contact) {
   const { email, phone } = extractEmailAndPhone(contact || {});
   const clientName = contact?.name || "Kommo Client";
@@ -611,6 +640,16 @@ function extractKommoBookingData(enrichedLead, contact) {
     )
   );
 
+  const serviceMapping = mapKommoServicesToAltegioServiceIds(serviceName);
+
+  console.log("KOMMO SERVICE SPLIT DEBUG", {
+    lead_id: enrichedLead?.id,
+    raw_service: serviceName,
+    service_names: serviceMapping.names,
+    service_ids: serviceMapping.serviceIds,
+    missing_services: serviceMapping.missing
+  });
+
   return {
     leadId: enrichedLead?.id,
     recordId: getKommoCustomFieldValue(
@@ -632,7 +671,11 @@ function extractKommoBookingData(enrichedLead, contact) {
     email,
     datetime,
     serviceName,
-    serviceId: mapKommoServiceToAltegioServiceId(serviceName),
+    serviceIds: serviceMapping.serviceIds,
+    missingServices: serviceMapping.missing,
+    serviceId: serviceMapping.missing.length
+      ? null
+      : serviceMapping.serviceIds[0] || null,
     staffId: Number(staffIdValue || process.env.ALTEGIO_DEFAULT_STAFF_ID) || null,
     companyId: Number(companyIdValue || process.env.ALTEGIO_COMPANY_ID) || null
   };
@@ -742,14 +785,41 @@ async function getAltegioServiceDuration({ companyId, serviceId, staffId }) {
 }
 
 async function buildAltegioRecordPayload({ bookingData, includeClient }) {
-  const seanceLength = await getAltegioServiceDuration({
-    companyId: bookingData.companyId,
-    serviceId: bookingData.serviceId,
-    staffId: bookingData.staffId
+  const serviceIds =
+    Array.isArray(bookingData.serviceIds) && bookingData.serviceIds.length
+      ? bookingData.serviceIds
+      : bookingData.serviceId
+        ? [bookingData.serviceId]
+        : [];
+
+  let seanceLength = 0;
+  const durationDebug = [];
+
+  for (const serviceId of serviceIds) {
+    const duration = await getAltegioServiceDuration({
+      companyId: bookingData.companyId,
+      serviceId,
+      staffId: bookingData.staffId
+    });
+
+    seanceLength += Number(duration) || 0;
+    durationDebug.push({ service_id: serviceId, duration });
+  }
+
+  if (!seanceLength) {
+    seanceLength = getDefaultAltegioSeanceLength();
+  }
+
+  console.log("ALTEGIO MULTI SERVICE IDS", {
+    lead_id: bookingData.leadId,
+    service_ids: serviceIds,
+    durations: durationDebug,
+    total_seance_length: seanceLength
   });
+
   const payload = {
     staff_id: bookingData.staffId,
-    services: [{ id: bookingData.serviceId }],
+    services: serviceIds.map((id) => ({ id })),
     seance_length: seanceLength,
     length: seanceLength,
     datetime: bookingData.datetime,
@@ -1327,6 +1397,14 @@ async function syncKommoExistingRecordUpdateToAltegio(
 
   if (!bookingData.serviceId) {
     missing.push("service_mapping");
+
+    if (bookingData.missingServices?.length) {
+      console.error("ALTEGIO SERVICE MAPPING FAILED", {
+        lead_id: bookingData.leadId,
+        raw_service: bookingData.serviceName,
+        missing_services: bookingData.missingServices
+      });
+    }
   }
 
   if (!bookingData.companyId) {
@@ -1576,6 +1654,14 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
 
   if (!bookingData.serviceId) {
     missing.push("service_mapping");
+
+    if (bookingData.missingServices?.length) {
+      console.error("ALTEGIO SERVICE MAPPING FAILED", {
+        lead_id: bookingData.leadId,
+        raw_service: bookingData.serviceName,
+        missing_services: bookingData.missingServices
+      });
+    }
   }
 
   if (!bookingData.companyId) {
