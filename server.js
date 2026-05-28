@@ -30,6 +30,38 @@ function getMetaEventNameByStatus(statusId) {
   return map[String(statusId)] || null;
 }
 
+function parseStatusIds(value) {
+  return String(value || "")
+    .split(",")
+    .map((statusId) => statusId.trim())
+    .filter(hasValue);
+}
+
+function getKommoCancelStatusIds() {
+  return [
+    process.env.CLOSED_STATUS_ID,
+    process.env.CANCELLED_STATUS_ID,
+    process.env.CANCEL_STATUS_ID,
+    process.env.KOMMO_CLOSED_STATUS_ID,
+    process.env.KOMMO_CANCEL_STATUS_ID,
+    ...parseStatusIds(process.env.CLOSED_STATUS_IDS),
+    ...parseStatusIds(process.env.CANCELLED_STATUS_IDS),
+    ...parseStatusIds(process.env.CANCEL_STATUS_IDS),
+    ...parseStatusIds(process.env.KOMMO_CANCEL_STATUS_IDS),
+    "143"
+  ]
+    .filter(hasValue)
+    .map((statusId) => String(statusId));
+}
+
+function isKommoCancelStatus(statusId) {
+  if (!hasValue(statusId)) {
+    return false;
+  }
+
+  return getKommoCancelStatusIds().includes(String(statusId));
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -830,6 +862,74 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
   };
 }
 
+function getKommoAltegioRecordId(entity) {
+  return getKommoCustomFieldValue(
+    entity,
+    [
+      ...KOMMO_ALTEGIO_FIELDS.recordId,
+      process.env.KOMMO_ALTEGIO_RECORD_FIELD_ID
+    ]
+  );
+}
+
+function getKommoAltegioCompanyId(entity) {
+  const companyId = getKommoCustomFieldValue(
+    entity,
+    KOMMO_ALTEGIO_FIELDS.companyId
+  );
+
+  return Number(companyId || process.env.ALTEGIO_COMPANY_ID) || null;
+}
+
+async function cancelAltegioRecordFromKommo({
+  leadId,
+  recordId,
+  companyId,
+  reason
+}) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const requestUrl = `${apiUrl}/api/v1/record/${companyId}/${recordId}`;
+  const requestConfig = {
+    headers: getAltegioApiHeaders()
+  };
+
+  console.log("ALTEGIO CANCEL REQUEST URL:", requestUrl);
+  console.log(
+    "ALTEGIO CANCEL REQUEST HEADERS:",
+    maskAltegioTokens(requestConfig.headers)
+  );
+
+  try {
+    const response = await axios.delete(requestUrl, requestConfig);
+
+    console.log("ALTEGIO RECORD CANCELLED FROM KOMMO", {
+      lead_id: leadId,
+      record_id: recordId,
+      company_id: companyId,
+      reason,
+      status: response.status
+    });
+
+    return response;
+  } catch (error) {
+    console.error("ALTEGIO RECORD CANCEL ERROR:", {
+      lead_id: leadId,
+      record_id: recordId,
+      company_id: companyId,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: maskAltegioTokens(error.response?.data),
+      headers: maskAltegioTokens(error.response?.headers)
+    });
+    console.log(
+      "ALTEGIO RESPONSE ERROR FULL:",
+      JSON.stringify(error.response?.data, null, 2)
+    );
+    throw error;
+  }
+}
+
 async function getKommoLeadNotes(leadId) {
   const response = await axios.get(
     `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}/notes`,
@@ -992,6 +1092,116 @@ async function addKommoNoteForAltegioRecord(leadId, recordId, visitId) {
       }
     }
   );
+}
+
+async function addKommoNoteForAltegioCancel(leadId, recordId, reason) {
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: [
+            "Source: Kommo",
+            "Action: Altegio record cancelled",
+            `Altegio Record ID: ${recordId}`,
+            `Reason: ${reason}`
+          ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
+async function syncKommoCancelToAltegio(lead, { isDeleteEvent, reason }) {
+  const leadId = lead?.id;
+  let enrichedLead = null;
+
+  if (isDeleteEvent) {
+    console.log("KOMMO LEAD DELETED", {
+      lead_id: leadId,
+      status_id: lead?.status_id
+    });
+  }
+
+  try {
+    if (hasValue(leadId)) {
+      enrichedLead = await getEnrichedKommoLead(leadId);
+    }
+  } catch (error) {
+    console.log("KOMMO CANCEL ENRICHMENT SKIPPED:", {
+      lead_id: leadId,
+      status: error.response?.status,
+      message: error.message
+    });
+  }
+
+  const recordId =
+    getKommoAltegioRecordId(enrichedLead) ||
+    getKommoAltegioRecordId(lead);
+  const companyId =
+    getKommoAltegioCompanyId(enrichedLead) ||
+    getKommoAltegioCompanyId(lead);
+
+  if (!hasValue(recordId)) {
+    console.log("ALTEGIO CANCEL SKIPPED - NO RECORD ID", {
+      lead_id: leadId,
+      reason
+    });
+
+    return {
+      cancelled: false,
+      skipped: true,
+      reason: "No Altegio record ID"
+    };
+  }
+
+  if (!companyId) {
+    console.log("ALTEGIO CANCEL SKIPPED - MISSING COMPANY ID", {
+      lead_id: leadId,
+      record_id: recordId,
+      reason
+    });
+
+    return {
+      cancelled: false,
+      skipped: true,
+      reason: "No Altegio company ID"
+    };
+  }
+
+  await cancelAltegioRecordFromKommo({
+    leadId,
+    recordId,
+    companyId,
+    reason
+  });
+
+  if (!isDeleteEvent) {
+    try {
+      await addKommoNoteForAltegioCancel(leadId, recordId, reason);
+    } catch (error) {
+      console.log("KOMMO CANCEL NOTE SKIPPED:", {
+        lead_id: leadId,
+        record_id: recordId,
+        message: error.message
+      });
+    }
+  }
+
+  return {
+    cancelled: true,
+    recordId,
+    companyId
+  };
 }
 
 async function syncKommoBookingToAltegio(enrichedLead, contact) {
@@ -1158,7 +1368,9 @@ app.post("/webhook/kommo", async (req, res) => {
 
     const lead =
       req.body?.leads?.status?.[0] ||
-      req.body?.leads?.update?.[0];
+      req.body?.leads?.update?.[0] ||
+      req.body?.leads?.delete?.[0];
+    const isDeleteEvent = Boolean(req.body?.leads?.delete?.[0]);
 
     if (!lead) {
       return res.json({
@@ -1168,18 +1380,43 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
-    const eventName = getMetaEventNameByStatus(lead.status_id);
+    const eventName = isDeleteEvent
+      ? null
+      : getMetaEventNameByStatus(lead.status_id);
+    const isCancelStatus = isKommoCancelStatus(lead.status_id);
 
     console.log("KOMMO EVENT DEBUG:", {
       lead_id: lead.id,
       status_id: lead.status_id,
       eventName,
+      isDeleteEvent,
+      isCancelStatus,
       trackedStatuses: {
         THINKING_STATUS_ID: process.env.THINKING_STATUS_ID,
         BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
-        SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID
+        SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID,
+        CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID,
+        CANCELLED_STATUS_ID: process.env.CANCELLED_STATUS_ID,
+        CANCEL_STATUS_IDS: getKommoCancelStatusIds()
       }
     });
+
+    if (isDeleteEvent || isCancelStatus) {
+      const cancelResult = await syncKommoCancelToAltegio(lead, {
+        isDeleteEvent,
+        reason: isDeleteEvent
+          ? "Kommo lead deleted"
+          : `Kommo lead moved to cancelled status ${lead.status_id}`
+      });
+
+      return res.json({
+        ok: true,
+        kommo_to_altegio_cancel: true,
+        lead_id: lead.id,
+        status_id: lead.status_id,
+        ...cancelResult
+      });
+    }
 
     if (!eventName) {
       return res.json({
