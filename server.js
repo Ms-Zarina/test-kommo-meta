@@ -1182,6 +1182,16 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     includeClient: true
   });
 
+  console.log("BEFORE ALTEGIO AVAILABILITY CHECK", {
+    lead_id: bookingData.leadId,
+    flow: "create",
+    record_id: bookingData.recordId || null,
+    staff_id: bookingData.staffId,
+    datetime: bookingData.datetime,
+    service_ids: payload.services?.map((service) => service.id),
+    seance_length: payload.seance_length
+  });
+
   const slotAvailable = await ensureAltegioSlotAvailable({ bookingData, payload });
 
   if (!slotAvailable) {
@@ -1257,6 +1267,16 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
   const payload = await buildAltegioRecordPayload({
     bookingData,
     includeClient: false
+  });
+
+  console.log("BEFORE ALTEGIO AVAILABILITY CHECK", {
+    lead_id: bookingData.leadId,
+    flow: "update",
+    record_id: bookingData.recordId || null,
+    staff_id: bookingData.staffId,
+    datetime: bookingData.datetime,
+    service_ids: payload.services?.map((service) => service.id),
+    seance_length: payload.seance_length
   });
 
   const slotAvailable = await ensureAltegioSlotAvailable({
