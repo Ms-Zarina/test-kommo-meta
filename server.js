@@ -676,6 +676,7 @@ function extractKommoBookingData(enrichedLead, contact) {
     serviceId: serviceMapping.missing.length
       ? null
       : serviceMapping.serviceIds[0] || null,
+    kommoStaffId: Number(staffIdValue) || null,
     staffId: Number(staffIdValue || process.env.ALTEGIO_DEFAULT_STAFF_ID) || null,
     companyId: Number(companyIdValue || process.env.ALTEGIO_COMPANY_ID) || null
   };
@@ -840,6 +841,122 @@ async function buildAltegioRecordPayload({ bookingData, includeClient }) {
   }
 
   return payload;
+}
+
+async function getAltegioServiceStaffIds({ companyId, serviceId }) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const requestUrl = `${apiUrl}/api/v1/company/${companyId}/services/${serviceId}`;
+
+  try {
+    const response = await axios.get(requestUrl, {
+      headers: getAltegioApiHeaders()
+    });
+    const responseData = response.data?.data;
+    const services = Array.isArray(responseData)
+      ? responseData
+      : [responseData];
+    const service =
+      services.find((item) =>
+        String(item?.id) === String(serviceId) ||
+        String(item?.salon_service_id) === String(serviceId)
+      ) || services.find(Boolean) || null;
+    const staff = Array.isArray(service?.staff) ? service.staff : [];
+
+    return staff
+      .map((item) => Number(item?.id))
+      .filter((id) => Number.isFinite(id) && id > 0);
+  } catch (error) {
+    console.error("ALTEGIO SERVICE STAFF FETCH ERROR", {
+      company_id: companyId,
+      service_id: serviceId,
+      status: error.response?.status,
+      message: error.message,
+      data: maskAltegioTokens(error.response?.data)
+    });
+
+    return [];
+  }
+}
+
+async function resolveAltegioStaffSelection({
+  companyId,
+  serviceIds,
+  kommoStaffId
+}) {
+  const perService = [];
+  let candidates = null;
+
+  for (const serviceId of serviceIds) {
+    const staffIds = await getAltegioServiceStaffIds({ companyId, serviceId });
+
+    perService.push({ service_id: serviceId, staff_ids: staffIds });
+
+    if (candidates === null) {
+      candidates = new Set(staffIds);
+    } else {
+      candidates = new Set(staffIds.filter((id) => candidates.has(id)));
+    }
+  }
+
+  const candidateStaff = candidates ? Array.from(candidates) : [];
+  const defaultStaffId = Number(process.env.ALTEGIO_DEFAULT_STAFF_ID) || null;
+
+  let selectedStaffId = null;
+  let source = null;
+
+  if (kommoStaffId) {
+    selectedStaffId = kommoStaffId;
+    source = "kommo_field";
+  } else if (defaultStaffId && candidateStaff.includes(defaultStaffId)) {
+    selectedStaffId = defaultStaffId;
+    source = "default_in_candidates";
+  } else if (candidateStaff.length) {
+    selectedStaffId = candidateStaff[0];
+    source = "auto_first_candidate";
+  } else {
+    source = "no_candidate";
+  }
+
+  return { selectedStaffId, candidateStaff, perService, source };
+}
+
+async function applyAltegioStaffSelection(bookingData) {
+  const serviceIds =
+    Array.isArray(bookingData.serviceIds) && bookingData.serviceIds.length
+      ? bookingData.serviceIds
+      : bookingData.serviceId
+        ? [bookingData.serviceId]
+        : [];
+  const selection = await resolveAltegioStaffSelection({
+    companyId: bookingData.companyId,
+    serviceIds,
+    kommoStaffId: bookingData.kommoStaffId
+  });
+
+  console.log("ALTEGIO STAFF SELECTION DEBUG", {
+    lead_id: bookingData.leadId,
+    service_ids: serviceIds,
+    kommo_staff_id: bookingData.kommoStaffId || null,
+    selected_staff_id: selection.selectedStaffId,
+    candidate_staff: selection.candidateStaff,
+    per_service_staff: selection.perService,
+    source: selection.source
+  });
+
+  if (!selection.selectedStaffId) {
+    console.error("ALTEGIO STAFF MAPPING FAILED", {
+      lead_id: bookingData.leadId,
+      service_ids: serviceIds,
+      candidate_staff: selection.candidateStaff
+    });
+
+    return false;
+  }
+
+  bookingData.staffId = selection.selectedStaffId;
+
+  return true;
 }
 
 function maskSecret(value) {
@@ -1432,6 +1549,23 @@ async function syncKommoExistingRecordUpdateToAltegio(
     };
   }
 
+  const staffSelected = await applyAltegioStaffSelection(bookingData);
+
+  if (!staffSelected) {
+    console.log("EXISTING RECORD UPDATE SKIPPED - NO STAFF FOR SERVICES", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      service_ids: bookingData.serviceIds,
+      reason
+    });
+
+    return {
+      updated: false,
+      skipped: true,
+      reason: "No staff provides selected services"
+    };
+  }
+
   console.log("EXISTING RECORD UPDATE START", {
     lead_id: bookingData.leadId,
     record_id: bookingData.recordId,
@@ -1677,6 +1811,17 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
       lead_id: bookingData.leadId,
       missing,
       service: bookingData.serviceName
+    });
+    return;
+  }
+
+  const staffSelected = await applyAltegioStaffSelection(bookingData);
+
+  if (!staffSelected) {
+    console.log("ALTEGIO CREATE/UPDATE SKIPPED - NO STAFF FOR SERVICES", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId || null,
+      service_ids: bookingData.serviceIds
     });
     return;
   }
