@@ -330,6 +330,50 @@ function logKommoLeadCustomFieldsDebug(lead) {
   );
 }
 
+function getWebhookEventType(body) {
+  if (body?.leads?.delete?.[0]) {
+    return "delete";
+  }
+
+  if (body?.leads?.status?.[0]) {
+    return "status";
+  }
+
+  if (body?.leads?.update?.[0]) {
+    return "update";
+  }
+
+  return "unknown";
+}
+
+function getWebhookCustomFieldsDebug(lead) {
+  const customFieldsValues = lead?.custom_fields_values || [];
+  const customFields = lead?.custom_fields || [];
+
+  return {
+    lead_id: lead?.id,
+    status_id: lead?.status_id,
+    custom_fields_values_count: customFieldsValues.length,
+    custom_fields_count: customFields.length,
+    custom_fields_values: customFieldsValues.map((field) => ({
+      field_id: field.field_id,
+      field_name: field.field_name,
+      field_code: field.field_code,
+      field_type: field.field_type,
+      values: field.values,
+      raw: field
+    })),
+    custom_fields: customFields.map((field) => ({
+      id: field.id,
+      name: field.name,
+      code: field.code,
+      type: field.type,
+      values: field.values,
+      raw: field
+    }))
+  };
+}
+
 function getKommoCustomField(entity, namesOrIds) {
   const requestedFields = (Array.isArray(namesOrIds) ? namesOrIds : [namesOrIds])
     .filter(hasValue)
@@ -819,8 +863,9 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     headers: getAltegioApiHeaders()
   };
 
+  console.log("ALTEGIO UPDATE REQUEST URL:", requestUrl);
   console.log(
-    "ALTEGIO RECORD UPDATE PAYLOAD",
+    "EXISTING RECORD UPDATE PAYLOAD",
     JSON.stringify(payload, null, 2)
   );
 
@@ -844,6 +889,18 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
 
   const responseData = response.data?.data;
   const record = Array.isArray(responseData) ? responseData[0] : responseData;
+
+  console.log(
+    "ALTEGIO UPDATE RESPONSE",
+    JSON.stringify(
+      {
+        status: response.status,
+        data: response.data
+      },
+      null,
+      2
+    )
+  );
 
   console.log("ALTEGIO RECORD UPDATE FROM KOMMO", {
     lead_id: bookingData.leadId,
@@ -1204,6 +1261,93 @@ async function syncKommoCancelToAltegio(lead, { isDeleteEvent, reason }) {
   };
 }
 
+async function syncKommoExistingRecordUpdateToAltegio(
+  enrichedLead,
+  contact,
+  reason
+) {
+  const bookingData = extractKommoBookingData(enrichedLead, contact);
+
+  console.log("KOMMO EXISTING RECORD UPDATE DEBUG", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId,
+    datetime: bookingData.datetime,
+    service: bookingData.serviceName,
+    service_id: bookingData.serviceId,
+    staff_id: bookingData.staffId,
+    company_id: bookingData.companyId,
+    reason
+  });
+
+  if (!hasValue(bookingData.recordId)) {
+    console.log("EXISTING RECORD UPDATE SKIPPED - NO RECORD ID", {
+      lead_id: bookingData.leadId,
+      reason
+    });
+
+    return {
+      updated: false,
+      skipped: true,
+      reason: "No existing Altegio record ID"
+    };
+  }
+
+  const missing = [];
+
+  if (!hasValue(bookingData.datetime)) {
+    missing.push("datetime");
+  }
+
+  if (!bookingData.serviceId) {
+    missing.push("service_mapping");
+  }
+
+  if (!bookingData.companyId) {
+    missing.push("company_id");
+  }
+
+  if (!bookingData.staffId) {
+    missing.push("staff_id");
+  }
+
+  if (missing.length) {
+    console.log("EXISTING RECORD UPDATE SKIPPED - MISSING REQUIRED DATA", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      missing,
+      service: bookingData.serviceName,
+      reason
+    });
+
+    return {
+      updated: false,
+      skipped: true,
+      reason: "Missing required data",
+      missing
+    };
+  }
+
+  console.log("EXISTING RECORD UPDATE START", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId,
+    company_id: bookingData.companyId,
+    datetime: bookingData.datetime,
+    service: bookingData.serviceName,
+    service_id: bookingData.serviceId,
+    staff_id: bookingData.staffId,
+    reason
+  });
+
+  const updatedRecord = await updateAltegioRecordFromKommo({ bookingData });
+
+  return {
+    updated: true,
+    recordId: updatedRecord.recordId,
+    visitId: updatedRecord.visitId,
+    companyId: bookingData.companyId
+  };
+}
+
 async function syncKommoBookingToAltegio(enrichedLead, contact) {
   const bookingData = extractKommoBookingData(enrichedLead, contact);
 
@@ -1250,6 +1394,15 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
   }
 
   if (hasValue(bookingData.recordId)) {
+    console.log("EXISTING RECORD UPDATE START", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      company_id: bookingData.companyId,
+      datetime: bookingData.datetime,
+      service: bookingData.serviceName,
+      service_id: bookingData.serviceId,
+      staff_id: bookingData.staffId
+    });
     await updateAltegioRecordFromKommo({ bookingData });
     return;
   }
@@ -1366,11 +1519,13 @@ app.post("/webhook/kommo", async (req, res) => {
     console.log("KOMMO WEBHOOK:");
     console.log(JSON.stringify(req.body, null, 2));
 
+    const webhookEventType = getWebhookEventType(req.body);
     const lead =
       req.body?.leads?.status?.[0] ||
       req.body?.leads?.update?.[0] ||
       req.body?.leads?.delete?.[0];
-    const isDeleteEvent = Boolean(req.body?.leads?.delete?.[0]);
+    const isDeleteEvent = webhookEventType === "delete";
+    const isUpdateEvent = webhookEventType === "update";
 
     if (!lead) {
       return res.json({
@@ -1384,6 +1539,16 @@ app.post("/webhook/kommo", async (req, res) => {
       ? null
       : getMetaEventNameByStatus(lead.status_id);
     const isCancelStatus = isKommoCancelStatus(lead.status_id);
+
+    console.log("WEBHOOK EVENT TYPE", {
+      type: webhookEventType,
+      lead_id: lead.id,
+      status_id: lead.status_id
+    });
+    console.log(
+      "UPDATED CUSTOM FIELDS",
+      JSON.stringify(getWebhookCustomFieldsDebug(lead), null, 2)
+    );
 
     console.log("KOMMO EVENT DEBUG:", {
       lead_id: lead.id,
@@ -1418,6 +1583,38 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
+    if (isUpdateEvent && !eventName) {
+      console.log("START KOMMO ENRICHMENT:", { lead_id: lead.id });
+
+      const enrichedLead = await getEnrichedKommoLead(lead.id);
+
+      console.log("FINISH KOMMO ENRICHMENT:", { lead_id: lead.id });
+
+      logEnrichedKommoLead(enrichedLead);
+      logKommoLeadCustomFieldsDebug(enrichedLead);
+
+      const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
+      let contactData = null;
+
+      if (contactId) {
+        contactData = await getContactById(contactId);
+      }
+
+      const updateResult = await syncKommoExistingRecordUpdateToAltegio(
+        enrichedLead,
+        contactData,
+        "Kommo update webhook without Meta-tracked status"
+      );
+
+      return res.json({
+        ok: true,
+        kommo_to_altegio_update: true,
+        lead_id: lead.id,
+        status_id: lead.status_id,
+        ...updateResult
+      });
+    }
+
     if (!eventName) {
       return res.json({
         ok: true,
@@ -1447,6 +1644,12 @@ app.post("/webhook/kommo", async (req, res) => {
           eventKey
         });
       }
+
+      console.log("DUPLICATE META EVENT - BOOKING SYNC CONTINUES:", {
+        eventKey,
+        lead_id: lead.id,
+        status_id: lead.status_id
+      });
     } else {
       sentEvents.add(eventKey);
     }
