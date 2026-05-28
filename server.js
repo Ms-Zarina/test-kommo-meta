@@ -471,6 +471,11 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     payload.client.email = bookingData.email;
   }
 
+  console.log(
+    "ALTEGIO CREATE PAYLOAD:",
+    JSON.stringify(payload, null, 2)
+  );
+
   const requestConfig = {
     headers: getAltegioApiHeaders()
   };
@@ -498,6 +503,10 @@ async function createAltegioRecordFromKommo({ bookingData }) {
       data: maskAltegioTokens(error.response?.data),
       headers: maskAltegioTokens(error.response?.headers)
     });
+    console.log(
+      "ALTEGIO RESPONSE ERROR FULL:",
+      JSON.stringify(error.response?.data, null, 2)
+    );
     throw error;
   }
 
