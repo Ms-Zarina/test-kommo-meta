@@ -62,6 +62,30 @@ function isKommoCancelStatus(statusId) {
   return getKommoCancelStatusIds().includes(String(statusId));
 }
 
+function getKommoNoAnswerStatusIds() {
+  return [
+    process.env.NO_ANSWER_STATUS_ID,
+    process.env.KOMMO_NO_ANSWER_STATUS_ID,
+    ...parseStatusIds(process.env.NO_ANSWER_STATUS_IDS),
+    ...parseStatusIds(process.env.KOMMO_NO_ANSWER_STATUS_IDS)
+  ]
+    .filter(hasValue)
+    .map((statusId) => String(statusId));
+}
+
+function isKommoNoAnswerStatus(statusId) {
+  if (!hasValue(statusId)) {
+    return false;
+  }
+
+  return getKommoNoAnswerStatusIds().includes(String(statusId));
+}
+
+function isKommoThinkingStatus(statusId) {
+  return hasValue(statusId) &&
+    String(statusId) === String(process.env.THINKING_STATUS_ID);
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -1348,6 +1372,173 @@ async function syncKommoExistingRecordUpdateToAltegio(
   };
 }
 
+async function routeKommoToAltegio({
+  enrichedLead,
+  contact,
+  webhookEventType,
+  webhookLead,
+  statusId
+}) {
+  const bookingData = extractKommoBookingData(enrichedLead, contact);
+  const isBookingStatus =
+    String(statusId) === String(process.env.BOOKING_STATUS_ID);
+  const isCancelStatus = isKommoCancelStatus(statusId);
+  const isThinkingStatus = isKommoThinkingStatus(statusId);
+  const isNoAnswerStatus = isKommoNoAnswerStatus(statusId);
+  const route = isBookingStatus
+    ? "booking"
+    : isCancelStatus
+      ? "cancel"
+      : isThinkingStatus
+        ? "thinking"
+        : isNoAnswerStatus
+          ? "no_answer"
+          : "no_altegio_action";
+
+  console.log("KOMMO TO ALTEGIO ROUTER START", {
+    lead_id: enrichedLead?.id || webhookLead?.id,
+    webhook_event_type: webhookEventType,
+    webhook_status_id: webhookLead?.status_id,
+    effective_status_id: statusId,
+    record_id: bookingData.recordId,
+    has_record_id: hasValue(bookingData.recordId),
+    datetime: bookingData.datetime,
+    has_datetime: hasValue(bookingData.datetime),
+    service: bookingData.serviceName,
+    service_id: bookingData.serviceId,
+    has_service: hasValue(bookingData.serviceName),
+    phone: bookingData.phone,
+    has_phone: hasValue(bookingData.phone),
+    staff_id: bookingData.staffId,
+    company_id: bookingData.companyId
+  });
+
+  console.log("KOMMO STATUS ROUTE", {
+    lead_id: enrichedLead?.id || webhookLead?.id,
+    status_id: statusId,
+    route,
+    booking_status_id: process.env.BOOKING_STATUS_ID,
+    thinking_status_id: process.env.THINKING_STATUS_ID,
+    no_answer_status_ids: getKommoNoAnswerStatusIds(),
+    cancel_status_ids: getKommoCancelStatusIds()
+  });
+
+  if (isBookingStatus) {
+    if (hasValue(bookingData.recordId)) {
+      console.log("KOMMO TO ALTEGIO UPDATE START", {
+        lead_id: bookingData.leadId,
+        record_id: bookingData.recordId,
+        status_id: statusId,
+        datetime: bookingData.datetime,
+        service: bookingData.serviceName,
+        service_id: bookingData.serviceId
+      });
+    }
+
+    await syncKommoBookingToAltegio(enrichedLead, contact);
+
+    return {
+      route,
+      synced: true,
+      recordId: bookingData.recordId || null
+    };
+  }
+
+  if (isCancelStatus) {
+    if (!hasValue(bookingData.recordId)) {
+      console.log("ALTEGIO CANCEL SKIPPED - NO RECORD ID", {
+        lead_id: bookingData.leadId,
+        status_id: statusId
+      });
+
+      return {
+        route,
+        synced: false,
+        skipped: true,
+        reason: "No existing Altegio record ID"
+      };
+    }
+
+    if (!bookingData.companyId) {
+      console.log("ALTEGIO CANCEL SKIPPED - MISSING COMPANY ID", {
+        lead_id: bookingData.leadId,
+        record_id: bookingData.recordId,
+        status_id: statusId
+      });
+
+      return {
+        route,
+        synced: false,
+        skipped: true,
+        reason: "No Altegio company ID"
+      };
+    }
+
+    await cancelAltegioRecordFromKommo({
+      leadId: bookingData.leadId,
+      recordId: bookingData.recordId,
+      companyId: bookingData.companyId,
+      reason: `Kommo lead moved to cancelled status ${statusId}`
+    });
+
+    try {
+      await addKommoNoteForAltegioCancel(
+        bookingData.leadId,
+        bookingData.recordId,
+        `Kommo lead moved to cancelled status ${statusId}`
+      );
+    } catch (error) {
+      console.log("KOMMO CANCEL NOTE SKIPPED:", {
+        lead_id: bookingData.leadId,
+        record_id: bookingData.recordId,
+        message: error.message
+      });
+    }
+
+    return {
+      route,
+      synced: true,
+      recordId: bookingData.recordId
+    };
+  }
+
+  if (isThinkingStatus || isNoAnswerStatus) {
+    console.log("KOMMO STATUS DOES NOT REQUIRE ALTEGIO CREATE", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      route,
+      record_id: bookingData.recordId || null
+    });
+    console.log("ALTEGIO STATUS SYNC SKIPPED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      route,
+      reason: "Status does not create or update Altegio appointment"
+    });
+
+    return {
+      route,
+      synced: false,
+      skipped: true,
+      reason: "Status does not require Altegio create"
+    };
+  }
+
+  console.log("ALTEGIO STATUS SYNC SKIPPED", {
+    lead_id: bookingData.leadId,
+    status_id: statusId,
+    route,
+    reason: "No Kommo to Altegio route for status"
+  });
+
+  return {
+    route,
+    synced: false,
+    skipped: true,
+    reason: "No Kommo to Altegio route for status"
+  };
+}
+
 async function syncKommoBookingToAltegio(enrichedLead, contact) {
   const bookingData = extractKommoBookingData(enrichedLead, contact);
 
@@ -1394,6 +1585,15 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
   }
 
   if (hasValue(bookingData.recordId)) {
+    console.log("KOMMO TO ALTEGIO UPDATE START", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      datetime: bookingData.datetime,
+      service: bookingData.serviceName,
+      service_id: bookingData.serviceId,
+      staff_id: bookingData.staffId,
+      company_id: bookingData.companyId
+    });
     console.log("EXISTING RECORD UPDATE START", {
       lead_id: bookingData.leadId,
       record_id: bookingData.recordId,
@@ -1525,7 +1725,6 @@ app.post("/webhook/kommo", async (req, res) => {
       req.body?.leads?.update?.[0] ||
       req.body?.leads?.delete?.[0];
     const isDeleteEvent = webhookEventType === "delete";
-    const isUpdateEvent = webhookEventType === "update";
 
     if (!lead) {
       return res.json({
@@ -1534,11 +1733,6 @@ app.post("/webhook/kommo", async (req, res) => {
         reason: "No lead data in webhook"
       });
     }
-
-    const eventName = isDeleteEvent
-      ? null
-      : getMetaEventNameByStatus(lead.status_id);
-    const isCancelStatus = isKommoCancelStatus(lead.status_id);
 
     console.log("WEBHOOK EVENT TYPE", {
       type: webhookEventType,
@@ -1550,28 +1744,26 @@ app.post("/webhook/kommo", async (req, res) => {
       JSON.stringify(getWebhookCustomFieldsDebug(lead), null, 2)
     );
 
-    console.log("KOMMO EVENT DEBUG:", {
-      lead_id: lead.id,
-      status_id: lead.status_id,
-      eventName,
-      isDeleteEvent,
-      isCancelStatus,
-      trackedStatuses: {
-        THINKING_STATUS_ID: process.env.THINKING_STATUS_ID,
-        BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
-        SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID,
-        CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID,
-        CANCELLED_STATUS_ID: process.env.CANCELLED_STATUS_ID,
-        CANCEL_STATUS_IDS: getKommoCancelStatusIds()
-      }
-    });
+    if (isDeleteEvent) {
+      console.log("KOMMO EVENT DEBUG:", {
+        lead_id: lead.id,
+        status_id: lead.status_id,
+        eventName: null,
+        isDeleteEvent,
+        isCancelStatus: false,
+        trackedStatuses: {
+          THINKING_STATUS_ID: process.env.THINKING_STATUS_ID,
+          BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
+          SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID,
+          CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID,
+          CANCELLED_STATUS_ID: process.env.CANCELLED_STATUS_ID,
+          CANCEL_STATUS_IDS: getKommoCancelStatusIds()
+        }
+      });
 
-    if (isDeleteEvent || isCancelStatus) {
       const cancelResult = await syncKommoCancelToAltegio(lead, {
         isDeleteEvent,
-        reason: isDeleteEvent
-          ? "Kommo lead deleted"
-          : `Kommo lead moved to cancelled status ${lead.status_id}`
+        reason: "Kommo lead deleted"
       });
 
       return res.json({
@@ -1583,77 +1775,6 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
-    if (isUpdateEvent && !eventName) {
-      console.log("START KOMMO ENRICHMENT:", { lead_id: lead.id });
-
-      const enrichedLead = await getEnrichedKommoLead(lead.id);
-
-      console.log("FINISH KOMMO ENRICHMENT:", { lead_id: lead.id });
-
-      logEnrichedKommoLead(enrichedLead);
-      logKommoLeadCustomFieldsDebug(enrichedLead);
-
-      const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
-      let contactData = null;
-
-      if (contactId) {
-        contactData = await getContactById(contactId);
-      }
-
-      const updateResult = await syncKommoExistingRecordUpdateToAltegio(
-        enrichedLead,
-        contactData,
-        "Kommo update webhook without Meta-tracked status"
-      );
-
-      return res.json({
-        ok: true,
-        kommo_to_altegio_update: true,
-        lead_id: lead.id,
-        status_id: lead.status_id,
-        ...updateResult
-      });
-    }
-
-    if (!eventName) {
-      return res.json({
-        ok: true,
-        skipped: true,
-        reason: "Status not tracked",
-        lead_id: lead.id,
-        status_id: lead.status_id
-      });
-    }
-
-    const eventKey = `${lead.id}_${lead.status_id}_${eventName}`;
-
-    console.log("KOMMO EVENT KEY:", eventKey);
-
-    const isDuplicateEvent = sentEvents.has(eventKey);
-    const isBookingStatus =
-      String(lead.status_id) === String(process.env.BOOKING_STATUS_ID);
-
-    if (isDuplicateEvent) {
-      console.log("DUPLICATE EVENT SKIPPED:", eventKey);
-
-      if (!isBookingStatus) {
-        return res.json({
-          ok: true,
-          skipped: true,
-          reason: "Duplicate event skipped",
-          eventKey
-        });
-      }
-
-      console.log("DUPLICATE META EVENT - BOOKING SYNC CONTINUES:", {
-        eventKey,
-        lead_id: lead.id,
-        status_id: lead.status_id
-      });
-    } else {
-      sentEvents.add(eventKey);
-    }
-
     console.log("START KOMMO ENRICHMENT:", { lead_id: lead.id });
 
     const enrichedLead = await getEnrichedKommoLead(lead.id);
@@ -1663,51 +1784,118 @@ app.post("/webhook/kommo", async (req, res) => {
     logEnrichedKommoLead(enrichedLead);
     logKommoLeadCustomFieldsDebug(enrichedLead);
     const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
+    let contactData = null;
 
-    if (!contactId) {
+    if (contactId) {
+      contactData = await getContactById(contactId);
+    }
+
+    const effectiveStatusId = lead.status_id || enrichedLead?.status_id;
+    const eventName = getMetaEventNameByStatus(effectiveStatusId);
+    const isCancelStatus = isKommoCancelStatus(effectiveStatusId);
+
+    console.log("KOMMO EVENT DEBUG:", {
+      lead_id: lead.id,
+      webhook_status_id: lead.status_id,
+      enriched_status_id: enrichedLead?.status_id,
+      status_id: effectiveStatusId,
+      eventName,
+      isDeleteEvent,
+      isCancelStatus,
+      trackedStatuses: {
+        THINKING_STATUS_ID: process.env.THINKING_STATUS_ID,
+        BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
+        SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID,
+        NO_ANSWER_STATUS_IDS: getKommoNoAnswerStatusIds(),
+        CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID,
+        CANCELLED_STATUS_ID: process.env.CANCELLED_STATUS_ID,
+        CANCEL_STATUS_IDS: getKommoCancelStatusIds()
+      }
+    });
+
+    let kommoToAltegioResult = null;
+
+    try {
+      kommoToAltegioResult = await routeKommoToAltegio({
+        enrichedLead,
+        contact: contactData,
+        webhookEventType,
+        webhookLead: lead,
+        statusId: effectiveStatusId
+      });
+    } catch (error) {
+      console.error("KOMMO TO ALTEGIO ERROR:", {
+        message: error.message,
+        lead_id: lead.id,
+        status_id: effectiveStatusId,
+        status: error.response?.status,
+        data: maskAltegioTokens(error.response?.data)
+      });
+      throw error;
+    }
+
+    if (!eventName) {
       return res.json({
         ok: true,
-        skipped: true,
-        reason: "No contact linked to lead",
-        lead_id: lead.id
+        lead_id: lead.id,
+        status_id: effectiveStatusId,
+        kommo_to_altegio: kommoToAltegioResult,
+        meta: {
+          skipped: true,
+          reason: "Status not tracked for Meta"
+        }
       });
     }
 
-    const contactData = await getContactById(contactId);
-    const { email, phone } = extractEmailAndPhone(contactData);
+    const eventKey = `${lead.id}_${effectiveStatusId}_${eventName}`;
+
+    console.log("KOMMO EVENT KEY:", eventKey);
+
+    const isDuplicateEvent = sentEvents.has(eventKey);
+
+    if (isDuplicateEvent) {
+      console.log("META DUPLICATE SKIPPED ONLY", {
+        eventKey,
+        lead_id: lead.id,
+        status_id: effectiveStatusId,
+        kommo_to_altegio: kommoToAltegioResult
+      });
+
+      return res.json({
+        ok: true,
+        lead_id: lead.id,
+        status_id: effectiveStatusId,
+        eventName,
+        kommo_to_altegio: kommoToAltegioResult,
+        meta: {
+          skipped: true,
+          reason: "Duplicate Meta event skipped",
+          eventKey
+        }
+      });
+    }
+
+    sentEvents.add(eventKey);
+
+    const { email, phone } = extractEmailAndPhone(contactData || {});
     const {
       fbp,
       fbc,
       source: attributionSource
     } = getMetaAttribution(enrichedLead, contactData);
 
-    if (isBookingStatus) {
-      try {
-        await syncKommoBookingToAltegio(enrichedLead, contactData);
-      } catch (error) {
-        console.error("KOMMO TO ALTEGIO ERROR:", {
-          message: error.message,
-          lead_id: lead.id
-        });
-      }
-    }
-
-    if (isDuplicateEvent) {
-      return res.json({
-        ok: true,
-        skipped: true,
-        reason: "Duplicate event skipped",
-        eventKey
-      });
-    }
-
     if (!email && !phone) {
       return res.json({
         ok: true,
-        skipped: true,
-        reason: "No email or phone in contact",
         lead_id: lead.id,
-        contact_id: contactId
+        status_id: effectiveStatusId,
+        eventName,
+        contact_id: contactId,
+        kommo_to_altegio: kommoToAltegioResult,
+        meta: {
+          skipped: true,
+          reason: "No email or phone in contact"
+        }
       });
     }
 
@@ -1744,8 +1932,9 @@ app.post("/webhook/kommo", async (req, res) => {
       ok: true,
       sent_to_meta: true,
       lead_id: lead.id,
-      status_id: lead.status_id,
+      status_id: effectiveStatusId,
       eventName,
+      kommo_to_altegio: kommoToAltegioResult,
       meta: metaResult
     });
   } catch (error) {
