@@ -298,6 +298,43 @@ function getKommoCustomFieldValue(entity, namesOrIds) {
   return getKommoCustomField(entity, namesOrIds)?.values?.[0]?.value ?? null;
 }
 
+function formatDateInPragueTime(date) {
+  const timeZone = "Europe/Prague";
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    hour12: false,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+  const parts = Object.fromEntries(
+    formatter.formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value])
+  );
+  const localTimeAsUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    Number(parts.hour),
+    Number(parts.minute),
+    Number(parts.second)
+  );
+  const offsetMinutes = Math.round((localTimeAsUtc - date.getTime()) / 60000);
+  const offsetSign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffsetMinutes = Math.abs(offsetMinutes);
+  const offsetHours = String(Math.floor(absoluteOffsetMinutes / 60))
+    .padStart(2, "0");
+  const offsetRemainderMinutes = String(absoluteOffsetMinutes % 60)
+    .padStart(2, "0");
+
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}${offsetSign}${offsetHours}:${offsetRemainderMinutes}`;
+}
+
 function normalizeAltegioDatetime(value) {
   if (!hasValue(value)) {
     return null;
@@ -306,11 +343,11 @@ function normalizeAltegioDatetime(value) {
   const textValue = String(value).trim();
 
   if (/^\d{10}$/.test(textValue)) {
-    return new Date(Number(textValue) * 1000).toISOString();
+    return formatDateInPragueTime(new Date(Number(textValue) * 1000));
   }
 
   if (/^\d{13}$/.test(textValue)) {
-    return new Date(Number(textValue)).toISOString();
+    return formatDateInPragueTime(new Date(Number(textValue)));
   }
 
   return textValue;
