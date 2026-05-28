@@ -558,6 +558,25 @@ function mapKommoServicesToAltegioServiceIds(serviceName) {
     return { names: [], serviceIds: [], missing: [] };
   }
 
+  // Exact full-string match wins over comma splitting, because some
+  // service names legitimately contain commas.
+  const exactName = String(serviceName).trim();
+  const exactServiceId = mapKommoServiceToAltegioServiceId(serviceName);
+
+  if (exactServiceId) {
+    console.log("ALTEGIO EXACT SERVICE MATCH", {
+      raw_service: serviceName,
+      service_name: exactName,
+      service_id: exactServiceId
+    });
+
+    return { names: [exactName], serviceIds: [exactServiceId], missing: [] };
+  }
+
+  console.log("ALTEGIO FALLBACK MULTI SPLIT", {
+    raw_service: serviceName
+  });
+
   const names = String(serviceName)
     .split(",")
     .map((name) => name.trim())
@@ -1409,6 +1428,17 @@ async function cancelAltegioRecordFromKommo({
 
     return response;
   } catch (error) {
+    if (error.response?.status === 404) {
+      console.log("ALTEGIO RECORD ALREADY MISSING", {
+        lead_id: leadId,
+        record_id: recordId,
+        company_id: companyId,
+        reason
+      });
+
+      return { skipped: true, alreadyMissing: true, status: 404 };
+    }
+
     console.error("ALTEGIO RECORD CANCEL ERROR:", {
       lead_id: leadId,
       record_id: recordId,
