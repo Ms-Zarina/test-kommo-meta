@@ -1117,6 +1117,7 @@ async function ensureAltegioSlotAvailable({ bookingData, payload, excludeRecordI
 
   await reportAltegioSlotUnavailable(bookingData, {
     source: "pre_check",
+    payload,
     date: availability.date,
     conflicts: availability.conflicts
   });
@@ -1131,23 +1132,289 @@ function isAltegioSlotConflict(error) {
   );
 }
 
-async function reportAltegioSlotUnavailable(bookingData, details) {
+async function reportAltegioSlotUnavailable(bookingData, details = {}) {
+  const { payload, ...logDetails } = details;
+
   console.error("ALTEGIO SLOT UNAVAILABLE", {
     lead_id: bookingData.leadId,
     record_id: bookingData.recordId || null,
     staff_id: bookingData.staffId,
     datetime: bookingData.datetime,
-    ...details
+    ...logDetails
   });
 
+  let suggestions = [];
+
+  if (payload) {
+    try {
+      const result = await suggestAltegioAlternativeSlots({ bookingData, payload });
+
+      suggestions = result.slots;
+
+      if (suggestions.length) {
+        console.log("ALTEGIO ALTERNATIVE SLOTS FOUND", {
+          lead_id: bookingData.leadId,
+          count: suggestions.length,
+          used_fallback_staff: result.usedFallbackStaff,
+          slots: suggestions
+        });
+      } else {
+        console.log("ALTEGIO NO ALTERNATIVE SLOTS FOUND", {
+          lead_id: bookingData.leadId,
+          staff_id: bookingData.staffId,
+          datetime: bookingData.datetime
+        });
+      }
+    } catch (error) {
+      console.error("ALTEGIO ALTERNATIVE SLOTS ERROR", {
+        lead_id: bookingData.leadId,
+        message: error.message
+      });
+    }
+  }
+
   try {
-    await addKommoNoteForAltegioSlotUnavailable(bookingData);
+    await addKommoNoteForAltegioSlotUnavailable(bookingData, suggestions);
   } catch (error) {
     console.log("KOMMO SLOT UNAVAILABLE NOTE SKIPPED:", {
       lead_id: bookingData.leadId,
       message: error.message
     });
   }
+}
+
+const ALTEGIO_ALTERNATIVE_SLOT_STEP_MIN = 30;
+const ALTEGIO_ALTERNATIVE_SEARCH_DAYS = 14;
+const ALTEGIO_ALTERNATIVE_MAX_RESULTS = 5;
+
+function addDaysToDateString(dateStr, days) {
+  const [year, month, day] = String(dateStr).split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  date.setUTCDate(date.getUTCDate() + days);
+
+  const yyyy = date.getUTCFullYear();
+  const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(date.getUTCDate()).padStart(2, "0");
+
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseHmToMinutes(value) {
+  const match = String(value || "").match(/(\d{1,2}):(\d{2})/);
+
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
+function minutesToHm(minutes) {
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
+}
+
+async function getAltegioStaffBusyIntervals({ companyId, staffId, date }) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const requestUrl =
+    `${apiUrl}/api/v1/records/${companyId}` +
+    `?staff_id=${staffId}&start_date=${date}&end_date=${date}&count=200`;
+
+  try {
+    const response = await axios.get(requestUrl, {
+      headers: getAltegioApiHeaders()
+    });
+    const records = Array.isArray(response.data?.data) ? response.data.data : [];
+    const intervals = [];
+
+    for (const record of records) {
+      if (record?.deleted) {
+        continue;
+      }
+
+      if (String(record?.staff_id) !== String(staffId)) {
+        continue;
+      }
+
+      const info = extractLocalDateAndMinutes(record?.date || record?.datetime);
+
+      if (!info || info.date !== date) {
+        continue;
+      }
+
+      const durationMin = Math.max(
+        1,
+        Math.ceil(
+          ((Number(record?.seance_length) || Number(record?.length) || 0) +
+            (Number(record?.technical_break_duration) || 0)) / 60
+        )
+      );
+
+      intervals.push({ start: info.minutes, end: info.minutes + durationMin });
+    }
+
+    return intervals;
+  } catch (error) {
+    console.error("ALTEGIO BUSY INTERVALS ERROR", {
+      company_id: companyId,
+      staff_id: staffId,
+      date,
+      status: error.response?.status,
+      message: error.message
+    });
+
+    // null signals "unknown" so the caller skips this day instead of
+    // suggesting a slot that might actually be taken.
+    return null;
+  }
+}
+
+async function findAltegioStaffOpenSlots({
+  companyId,
+  staffId,
+  durationMin,
+  fromDate,
+  days,
+  maxResults,
+  nowDate,
+  nowMinutes
+}) {
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const toDate = addDaysToDateString(fromDate, days);
+  let schedule = [];
+
+  try {
+    const response = await axios.get(
+      `${apiUrl}/api/v1/schedule/${companyId}/${staffId}/${fromDate}/${toDate}`,
+      { headers: getAltegioApiHeaders() }
+    );
+    schedule = Array.isArray(response.data?.data) ? response.data.data : [];
+  } catch (error) {
+    console.error("ALTEGIO SCHEDULE ERROR", {
+      company_id: companyId,
+      staff_id: staffId,
+      status: error.response?.status,
+      message: error.message
+    });
+
+    return [];
+  }
+
+  const slots = [];
+
+  for (const day of schedule) {
+    if (slots.length >= maxResults) {
+      break;
+    }
+
+    if (!day?.is_working || !Array.isArray(day?.slots) || !day.slots.length) {
+      continue;
+    }
+
+    const busy = await getAltegioStaffBusyIntervals({
+      companyId,
+      staffId,
+      date: day.date
+    });
+
+    if (busy === null) {
+      continue;
+    }
+
+    for (const workingSlot of day.slots) {
+      if (slots.length >= maxResults) {
+        break;
+      }
+
+      const fromMin = parseHmToMinutes(workingSlot.from);
+      const toMin = parseHmToMinutes(workingSlot.to);
+
+      if (fromMin === null || toMin === null) {
+        continue;
+      }
+
+      const minStart = day.date === nowDate ? Math.max(fromMin, nowMinutes) : fromMin;
+
+      for (let start = fromMin; start + durationMin <= toMin; start += ALTEGIO_ALTERNATIVE_SLOT_STEP_MIN) {
+        if (start < minStart) {
+          continue;
+        }
+
+        const end = start + durationMin;
+        const conflict = busy.some((interval) => start < interval.end && interval.start < end);
+
+        if (!conflict) {
+          slots.push({ date: day.date, time: minutesToHm(start), staff_id: staffId });
+
+          if (slots.length >= maxResults) {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  return slots;
+}
+
+async function suggestAltegioAlternativeSlots({ bookingData, payload }) {
+  const serviceIds = (payload.services || [])
+    .map((service) => service.id)
+    .filter(Boolean);
+  const durationMin = Math.max(1, Math.ceil((Number(payload.seance_length) || 0) / 60));
+  const selectedStaffId = bookingData.staffId;
+  const now = extractLocalDateAndMinutes(formatDateInPragueTime(new Date()));
+  const fromDate = now?.date || extractLocalDateAndMinutes(bookingData.datetime)?.date;
+
+  if (!fromDate || !selectedStaffId) {
+    return { slots: [], usedFallbackStaff: false };
+  }
+
+  const searchArgs = {
+    companyId: bookingData.companyId,
+    durationMin,
+    fromDate,
+    days: ALTEGIO_ALTERNATIVE_SEARCH_DAYS,
+    nowDate: now?.date || null,
+    nowMinutes: now?.minutes || 0
+  };
+
+  let slots = await findAltegioStaffOpenSlots({
+    ...searchArgs,
+    staffId: selectedStaffId,
+    maxResults: ALTEGIO_ALTERNATIVE_MAX_RESULTS
+  });
+  let usedFallbackStaff = false;
+
+  if (slots.length === 0 && serviceIds.length) {
+    const selection = await resolveAltegioStaffSelection({
+      companyId: bookingData.companyId,
+      serviceIds,
+      kommoStaffId: null
+    });
+    const otherStaff = selection.candidateStaff.filter(
+      (id) => String(id) !== String(selectedStaffId)
+    );
+
+    for (const staffId of otherStaff) {
+      if (slots.length >= ALTEGIO_ALTERNATIVE_MAX_RESULTS) {
+        break;
+      }
+
+      const staffSlots = await findAltegioStaffOpenSlots({
+        ...searchArgs,
+        staffId,
+        maxResults: ALTEGIO_ALTERNATIVE_MAX_RESULTS - slots.length
+      });
+
+      slots = slots.concat(staffSlots);
+    }
+
+    usedFallbackStaff = slots.length > 0;
+  }
+
+  return { slots: slots.slice(0, ALTEGIO_ALTERNATIVE_MAX_RESULTS), usedFallbackStaff };
 }
 
 function maskSecret(value) {
@@ -1248,6 +1515,7 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     if (isAltegioSlotConflict(error)) {
       await reportAltegioSlotUnavailable(bookingData, {
         source: "altegio_409",
+        payload,
         data: maskAltegioTokens(error.response?.data)
       });
 
@@ -1328,6 +1596,7 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     if (isAltegioSlotConflict(error)) {
       await reportAltegioSlotUnavailable(bookingData, {
         source: "altegio_409",
+        payload,
         data: maskAltegioTokens(error.response?.data)
       });
 
@@ -1649,7 +1918,20 @@ async function addKommoNoteForAltegioCancel(leadId, recordId, reason) {
   );
 }
 
-async function addKommoNoteForAltegioSlotUnavailable(bookingData) {
+async function addKommoNoteForAltegioSlotUnavailable(bookingData, suggestions = []) {
+  const lines = [
+    "Source: Kommo",
+    "Selected Altegio slot unavailable.",
+    `Requested: ${bookingData.datetime || "Not specified"}, Staff ID: ${bookingData.staffId || "Not specified"}`
+  ];
+
+  if (suggestions.length) {
+    lines.push("Available alternatives:");
+    suggestions.forEach((slot, index) => {
+      lines.push(`${index + 1}) ${slot.date} ${slot.time}, Staff ID: ${slot.staff_id}`);
+    });
+  }
+
   await axios.post(
     `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
     [
@@ -1657,12 +1939,7 @@ async function addKommoNoteForAltegioSlotUnavailable(bookingData) {
         entity_id: Number(bookingData.leadId),
         note_type: "common",
         params: {
-          text: [
-            "Source: Kommo",
-            "Selected Altegio slot unavailable",
-            `Datetime: ${bookingData.datetime || "Not specified"}`,
-            `Staff ID: ${bookingData.staffId || "Not specified"}`
-          ].join("\n")
+          text: lines.join("\n")
         }
       }
     ],
