@@ -3521,7 +3521,15 @@ async function markKommoLeadAsSourcedFromAltegio(lead, data) {
     });
   }
 
-  await addKommoLeadNoteFromAltegio(lead.id, data);
+  // Best-effort note: must NEVER block the Kommo status update that follows.
+  try {
+    await addKommoLeadNoteFromAltegio(lead.id, data);
+  } catch (error) {
+    console.log("ALTEGIO SOURCE NOTE SKIPPED:", {
+      lead_id: lead.id,
+      message: error.message
+    });
+  }
 }
 
 async function updateKommoLeadStatus(leadId, statusId) {
@@ -3866,8 +3874,25 @@ app.post("/altegio/webhook", async (req, res) => {
     }
 
     if (String(targetStatusId) === String(process.env.BOOKING_STATUS_ID)) {
-      await markKommoLeadAsSourcedFromAltegio(lead, data);
+      // Non-blocking: a note/source-marking failure must not prevent the
+      // Kommo status update below.
+      try {
+        await markKommoLeadAsSourcedFromAltegio(lead, data);
+      } catch (error) {
+        console.error("ALTEGIO MARK SOURCED ERROR (status update continues):", {
+          lead_id: lead.id,
+          message: error.message
+        });
+      }
     }
+
+    console.log("ALTEGIO -> KOMMO STATUS UPDATE", {
+      lead_id: lead.id,
+      altegio_status: status,
+      attendance: data?.attendance,
+      confirmed: data?.confirmed,
+      target_status_id: targetStatusId
+    });
 
     const updatedLead = await updateKommoLeadFromAltegio({
       lead,
