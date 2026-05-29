@@ -1555,6 +1555,30 @@ async function createAltegioRecordFromKommo({ bookingData }) {
   };
 }
 
+function isAltegioRecordUpToDate(record, payload) {
+  const recordTime = extractLocalDateAndMinutes(record?.datetime);
+  const payloadTime = extractLocalDateAndMinutes(payload?.datetime);
+  const sameDatetime =
+    recordTime &&
+    payloadTime &&
+    recordTime.date === payloadTime.date &&
+    recordTime.minutes === payloadTime.minutes;
+
+  const recordServices = (record?.services || [])
+    .map((service) => String(service.id))
+    .sort();
+  const payloadServices = (payload?.services || [])
+    .map((service) => String(service.id))
+    .sort();
+  const sameServices =
+    recordServices.length === payloadServices.length &&
+    recordServices.every((id, index) => id === payloadServices[index]);
+
+  const sameStaff = String(record?.staff_id) === String(payload?.staff_id);
+
+  return Boolean(sameDatetime && sameServices && sameStaff);
+}
+
 async function updateAltegioRecordFromKommo({ bookingData }) {
   const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
     .replace(/\/$/, "");
@@ -1565,6 +1589,40 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     bookingData,
     includeClient: true
   });
+
+  // LOOP PROTECTION: a Kommo<->Altegio webhook ping-pong keeps re-sending the
+  // same datetime/services/staff. Skip the PUT (and the Kommo note) when the
+  // Altegio record already matches, so the sync settles after one real change.
+  try {
+    const current = await axios.get(requestUrl, {
+      headers: getAltegioApiHeaders()
+    });
+    const currentRecord = current.data?.data;
+
+    if (currentRecord && isAltegioRecordUpToDate(currentRecord, payload)) {
+      console.log("ALTEGIO UPDATE SKIPPED - NO CHANGES", {
+        lead_id: bookingData.leadId,
+        record_id: bookingData.recordId,
+        datetime: payload.datetime,
+        service_ids: payload.services?.map((service) => service.id),
+        staff_id: payload.staff_id
+      });
+
+      return {
+        unchanged: true,
+        recordId: bookingData.recordId,
+        visitId: currentRecord.visit_id || bookingData.visitId || null,
+        record: currentRecord
+      };
+    }
+  } catch (error) {
+    console.log("ALTEGIO UPDATE CHANGE-CHECK SKIPPED", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      status: error.response?.status,
+      message: error.message
+    });
+  }
 
   console.log("BEFORE ALTEGIO AVAILABILITY CHECK", {
     lead_id: bookingData.leadId,
@@ -1590,11 +1648,13 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     headers: getAltegioApiHeaders()
   };
 
-  console.log("ALTEGIO UPDATE REQUEST URL:", requestUrl);
-  console.log(
-    "EXISTING RECORD UPDATE PAYLOAD",
-    JSON.stringify(payload, null, 2)
-  );
+  console.log("ALTEGIO UPDATE REQUEST", {
+    url: requestUrl,
+    datetime: payload.datetime,
+    service_ids: payload.services?.map((service) => service.id),
+    staff_id: payload.staff_id,
+    seance_length: payload.seance_length
+  });
 
   let response;
 
@@ -1630,17 +1690,11 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
   const responseData = response.data?.data;
   const record = Array.isArray(responseData) ? responseData[0] : responseData;
 
-  console.log(
-    "ALTEGIO UPDATE RESPONSE",
-    JSON.stringify(
-      {
-        status: response.status,
-        data: response.data
-      },
-      null,
-      2
-    )
-  );
+  console.log("ALTEGIO UPDATE RESPONSE", {
+    status: response.status,
+    record_id: record?.id || bookingData.recordId,
+    visit_id: record?.visit_id || bookingData.visitId || null
+  });
 
   console.log("ALTEGIO RECORD UPDATE FROM KOMMO", {
     lead_id: bookingData.leadId,
@@ -2598,30 +2652,21 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
   }
 
   if (hasValue(bookingData.recordId)) {
-    console.log("KOMMO TO ALTEGIO UPDATE START", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId,
-      datetime: bookingData.datetime,
-      service: bookingData.serviceName,
-      service_id: bookingData.serviceId,
-      staff_id: bookingData.staffId,
-      company_id: bookingData.companyId
-    });
     console.log("EXISTING RECORD UPDATE START", {
       lead_id: bookingData.leadId,
       record_id: bookingData.recordId,
       company_id: bookingData.companyId,
       datetime: bookingData.datetime,
       service: bookingData.serviceName,
-      service_id: bookingData.serviceId,
       staff_id: bookingData.staffId
     });
 
     const updateResult = await updateAltegioRecordFromKommo({ bookingData });
 
-    // updateResult.skipped means the slot was unavailable (its own note was
-    // already added); only note a genuine successful update.
-    if (!updateResult?.skipped) {
+    // Only note a genuine, applied update. Skip the note when the slot was
+    // unavailable (skipped - its own note was added) or when nothing changed
+    // (unchanged - avoids note spam from the webhook ping-pong).
+    if (!updateResult?.skipped && !updateResult?.unchanged) {
       try {
         await addKommoNoteForAltegioRecordUpdated(
           bookingData.leadId,
