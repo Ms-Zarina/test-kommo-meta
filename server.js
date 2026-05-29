@@ -1667,21 +1667,31 @@ function getKommoAltegioCompanyId(entity) {
   return Number(companyId || process.env.ALTEGIO_COMPANY_ID) || null;
 }
 
+// Hard safety flag. Defaults to TRUE: Kommo events must never delete or
+// cancel-write Altegio records. Only an explicit DISABLE_ALTEGIO_DELETE=false
+// re-enables any write in the cancel/delete path.
+function isAltegioDeleteDisabled() {
+  return (
+    String(process.env.DISABLE_ALTEGIO_DELETE || "true").trim().toLowerCase() !==
+    "false"
+  );
+}
+
 async function cancelAltegioRecordFromKommo({
   leadId,
   recordId,
   companyId,
   reason
 }) {
-  // SAFETY: Altegio record deletion/cancellation from Kommo is permanently
-  // disabled. Admins may create and manage Altegio records manually, so Kommo
-  // events must NEVER delete or cancel an Altegio record. This function no
-  // longer performs any DELETE request - it only logs and returns.
+  // SAFETY: Altegio record deletion/cancellation from Kommo is disabled. This
+  // function NEVER performs a DELETE. With DISABLE_ALTEGIO_DELETE (default
+  // true) it returns immediately, before any Altegio API call.
   console.log("ALTEGIO DELETE DISABLED", {
     lead_id: leadId,
     record_id: recordId || null,
     company_id: companyId || null,
     reason,
+    delete_disabled: isAltegioDeleteDisabled(),
     note: "Altegio record deletion from Kommo is disabled; record kept."
   });
 
@@ -1699,6 +1709,21 @@ async function cancelAltegioRecordFromKommo({
 // services and is not update-blocked); otherwise the record is left untouched
 // and the caller falls back to keeping it.
 async function moveAltegioRecordToCancelled({ companyId, recordId, leadId }) {
+  // HARD SAFETY GATE: with DISABLE_ALTEGIO_DELETE (default true), make NO
+  // Altegio API call at all - no GET, no PUT, no DELETE. The record is left
+  // completely untouched and the caller keeps it.
+  if (isAltegioDeleteDisabled()) {
+    console.log("ALTEGIO DELETE DISABLED", {
+      lead_id: leadId,
+      record_id: recordId || null,
+      company_id: companyId || null,
+      flag: "DISABLE_ALTEGIO_DELETE",
+      detail: "Cancel/delete writes to Altegio are disabled; no API call made."
+    });
+
+    return { moved: false, reason: "delete_disabled_flag" };
+  }
+
   if (!companyId || !recordId) {
     return { moved: false, reason: "missing_ids" };
   }
