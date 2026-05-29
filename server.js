@@ -2571,8 +2571,53 @@ async function routeKommoToAltegio({
   };
 }
 
+// Short-TTL dedup so duplicate/near-simultaneous Kommo webhooks for the same
+// booking intent don't trigger the Altegio create/update twice.
+const recentAltegioBookingSyncs = new Map();
+const ALTEGIO_BOOKING_SYNC_DEDUP_MS = 15000;
+
+function shouldSkipDuplicateAltegioBookingSync(signature) {
+  const now = Date.now();
+
+  for (const [key, timestamp] of recentAltegioBookingSyncs) {
+    if (now - timestamp > ALTEGIO_BOOKING_SYNC_DEDUP_MS) {
+      recentAltegioBookingSyncs.delete(key);
+    }
+  }
+
+  const last = recentAltegioBookingSyncs.get(signature);
+
+  if (last && now - last < ALTEGIO_BOOKING_SYNC_DEDUP_MS) {
+    return true;
+  }
+
+  // Set synchronously (before any await) so concurrent webhooks can't both pass.
+  recentAltegioBookingSyncs.set(signature, now);
+  return false;
+}
+
 async function syncKommoBookingToAltegio(enrichedLead, contact) {
   const bookingData = extractKommoBookingData(enrichedLead, contact);
+
+  const dedupSignature = [
+    bookingData.leadId,
+    bookingData.recordId || "new",
+    bookingData.datetime || "",
+    (bookingData.serviceIds || []).join(","),
+    bookingData.staffId || ""
+  ].join("|");
+
+  if (
+    hasValue(bookingData.leadId) &&
+    shouldSkipDuplicateAltegioBookingSync(dedupSignature)
+  ) {
+    console.log("ALTEGIO SYNC SKIPPED - DUPLICATE WEBHOOK", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId || null,
+      signature: dedupSignature
+    });
+    return;
+  }
 
   console.log("KOMMO TO ALTEGIO DEBUG", {
     lead_id: bookingData.leadId,
