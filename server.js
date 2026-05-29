@@ -2038,9 +2038,72 @@ async function addKommoNoteForAltegioRecord(leadId, recordId, visitId) {
         params: {
           text: [
             "Source: Kommo",
+            "Altegio record created from Kommo",
             `Altegio Record ID: ${recordId}`,
             `Altegio Visit ID: ${visitId || "Not specified"}`
           ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
+async function addKommoNoteForAltegioRecordUpdated(leadId, recordId, visitId) {
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: [
+            "Source: Kommo",
+            "Altegio record updated from Kommo",
+            `Altegio Record ID: ${recordId || "Not specified"}`,
+            `Altegio Visit ID: ${visitId || "Not specified"}`
+          ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
+async function addKommoNoteForAltegioBookingSkipped(leadId, missing, missingServices) {
+  const lines = [
+    "Source: Kommo",
+    "Altegio record was NOT created/updated - missing required data."
+  ];
+
+  if (Array.isArray(missing) && missing.length) {
+    lines.push(`Missing: ${missing.join(", ")}`);
+  }
+
+  if (Array.isArray(missingServices) && missingServices.length) {
+    lines.push(`Unrecognized service(s): ${missingServices.join(", ")}`);
+  }
+
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: lines.join("\n")
         }
       }
     ],
@@ -2064,7 +2127,7 @@ async function addKommoNoteForAltegioRecordKept(leadId) {
         params: {
           text: [
             "Source: Kommo",
-            "Kommo marked as cancelled. Altegio record was NOT deleted. Please cancel manually in Altegio if needed."
+            "Kommo marked as cancelled. Altegio record was NOT changed."
           ].join("\n")
         }
       }
@@ -2494,6 +2557,22 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
       missing,
       service: bookingData.serviceName
     });
+
+    if (hasValue(bookingData.leadId)) {
+      try {
+        await addKommoNoteForAltegioBookingSkipped(
+          bookingData.leadId,
+          missing,
+          bookingData.missingServices
+        );
+      } catch (error) {
+        console.log("KOMMO SKIPPED NOTE FAILED:", {
+          lead_id: bookingData.leadId,
+          message: error.message
+        });
+      }
+    }
+
     return;
   }
 
@@ -2527,7 +2606,27 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
       service_id: bookingData.serviceId,
       staff_id: bookingData.staffId
     });
-    await updateAltegioRecordFromKommo({ bookingData });
+
+    const updateResult = await updateAltegioRecordFromKommo({ bookingData });
+
+    // updateResult.skipped means the slot was unavailable (its own note was
+    // already added); only note a genuine successful update.
+    if (!updateResult?.skipped) {
+      try {
+        await addKommoNoteForAltegioRecordUpdated(
+          bookingData.leadId,
+          updateResult?.recordId || bookingData.recordId,
+          updateResult?.visitId || bookingData.visitId
+        );
+      } catch (error) {
+        console.log("KOMMO UPDATE NOTE FAILED:", {
+          lead_id: bookingData.leadId,
+          record_id: bookingData.recordId,
+          message: error.message
+        });
+      }
+    }
+
     return;
   }
 
@@ -3566,7 +3665,12 @@ app.post("/altegio/webhook", async (req, res) => {
     }
 
     if (data?.attendance === -1 || data?.visit_attendance === -1) {
-      targetStatusId = process.env.CLOSED_STATUS_ID;
+      // Altegio cancelled/no-show -> Kommo "Отмена". Prefer a dedicated cancel
+      // status if configured; fall back to CLOSED_STATUS_ID (existing behavior).
+      targetStatusId =
+        process.env.CANCELLED_STATUS_ID ||
+        process.env.CANCEL_STATUS_ID ||
+        process.env.CLOSED_STATUS_ID;
     }
 
     if (!targetStatusId) {
