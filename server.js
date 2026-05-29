@@ -851,7 +851,9 @@ async function buildAltegioRecordPayload({ bookingData, includeClient }) {
     api_id: `kommo_lead_${bookingData.leadId}`
   };
 
-  if (includeClient) {
+  // Altegio requires a `client` object for BOTH create and update (PUT/POST).
+  // Include it whenever we have a phone to attach.
+  if (includeClient && hasValue(bookingData.phone)) {
     payload.client = {
       phone: bookingData.phone,
       name: bookingData.name
@@ -1527,6 +1529,9 @@ async function createAltegioRecordFromKommo({ bookingData }) {
       status: error.response?.status,
       statusText: error.response?.statusText,
       data: maskAltegioTokens(error.response?.data),
+      validation_errors: JSON.stringify(
+        error.response?.data?.meta?.errors ?? error.response?.data?.errors ?? null
+      ),
       headers: maskAltegioTokens(error.response?.headers)
     });
     console.log(
@@ -1554,9 +1559,11 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
   const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
     .replace(/\/$/, "");
   const requestUrl = `${apiUrl}/api/v1/record/${bookingData.companyId}/${bookingData.recordId}`;
+  // Altegio's record update (PUT) also requires the client object, otherwise
+  // it returns 422. Include it just like create.
   const payload = await buildAltegioRecordPayload({
     bookingData,
-    includeClient: false
+    includeClient: true
   });
 
   console.log("BEFORE ALTEGIO AVAILABILITY CHECK", {
@@ -1608,6 +1615,9 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
       status: error.response?.status,
       statusText: error.response?.statusText,
       data: maskAltegioTokens(error.response?.data),
+      validation_errors: JSON.stringify(
+        error.response?.data?.meta?.errors ?? error.response?.data?.errors ?? null
+      ),
       headers: maskAltegioTokens(error.response?.headers)
     });
     console.log(
