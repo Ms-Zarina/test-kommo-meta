@@ -1603,7 +1603,8 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
       console.log("ALTEGIO UPDATE SKIPPED - NO CHANGES", {
         lead_id: bookingData.leadId,
         record_id: bookingData.recordId,
-        datetime: payload.datetime,
+        kommo_datetime: payload.datetime,
+        altegio_datetime: currentRecord.datetime,
         service_ids: payload.services?.map((service) => service.id),
         staff_id: payload.staff_id
       });
@@ -2574,7 +2575,10 @@ async function routeKommoToAltegio({
 // Short-TTL dedup so duplicate/near-simultaneous Kommo webhooks for the same
 // booking intent don't trigger the Altegio create/update twice.
 const recentAltegioBookingSyncs = new Map();
-const ALTEGIO_BOOKING_SYNC_DEDUP_MS = 15000;
+// Short window: only collapses near-simultaneous duplicate webhook deliveries.
+// The Kommo<->Altegio echo loop is handled separately by change-detection, so
+// this must stay small to never block a legitimate re-edit of the booking.
+const ALTEGIO_BOOKING_SYNC_DEDUP_MS = 5000;
 
 function shouldSkipDuplicateAltegioBookingSync(signature) {
   const now = Date.now();
