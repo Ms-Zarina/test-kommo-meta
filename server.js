@@ -2916,9 +2916,6 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 app.post("/webhook/kommo", async (req, res) => {
   try {
-    console.log("KOMMO WEBHOOK:");
-    console.log(JSON.stringify(req.body, null, 2));
-
     const webhookEventType = getWebhookEventType(req.body);
     const lead =
       req.body?.leads?.status?.[0] ||
@@ -3721,10 +3718,23 @@ function getValidPurchaseValue(data) {
 
 app.post("/altegio/webhook", async (req, res) => {
   try {
-    console.log("ALTEGIO WEBHOOK:");
-    console.log(JSON.stringify(req.body, null, 2));
-
     const { resource, status, data } = req.body;
+
+    console.log("ALTEGIO WEBHOOK:", JSON.stringify({
+      resource,
+      status,
+      record: {
+        id: data?.id,
+        datetime: data?.datetime,
+        attendance: data?.attendance,
+        visit_attendance: data?.visit_attendance,
+        confirmed: data?.confirmed,
+        deleted: data?.deleted,
+        staff_id: data?.staff_id,
+        services: (data?.services || []).map((service) => service.id),
+        client_phone: data?.client?.phone
+      }
+    }));
 
     if (resource !== "record") {
       return res.status(200).json({
