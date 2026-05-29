@@ -1693,6 +1693,177 @@ async function cancelAltegioRecordFromKommo({
   };
 }
 
+// Best-effort, non-destructive cancellation: marks the Altegio record as
+// "did not come" (attendance: -1), which Altegio treats as cancelled. NEVER
+// deletes. Only attempts the update when it is safe to do so (the record has
+// services and is not update-blocked); otherwise the record is left untouched
+// and the caller falls back to keeping it.
+async function moveAltegioRecordToCancelled({ companyId, recordId, leadId }) {
+  if (!companyId || !recordId) {
+    return { moved: false, reason: "missing_ids" };
+  }
+
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const recordUrl = `${apiUrl}/api/v1/record/${companyId}/${recordId}`;
+  let record = null;
+
+  try {
+    const response = await axios.get(recordUrl, {
+      headers: getAltegioApiHeaders()
+    });
+    record = response.data?.data;
+  } catch (error) {
+    if (error.response?.status === 404) {
+      console.log("ALTEGIO RECORD ALREADY MISSING", {
+        lead_id: leadId,
+        record_id: recordId,
+        company_id: companyId
+      });
+
+      return { moved: false, reason: "record_missing" };
+    }
+
+    console.error("ALTEGIO CANCEL FETCH ERROR", {
+      lead_id: leadId,
+      record_id: recordId,
+      company_id: companyId,
+      status: error.response?.status,
+      message: error.message
+    });
+
+    return { moved: false, reason: "fetch_failed" };
+  }
+
+  if (!record || record.deleted) {
+    return { moved: false, reason: "record_missing" };
+  }
+
+  if (Number(record.attendance) === -1) {
+    return { moved: true, reason: "already_cancelled" };
+  }
+
+  const services = Array.isArray(record.services) ? record.services : [];
+
+  // Altegio record update requires a service and rejects locked records.
+  // These admin-managed/block records cannot be status-updated safely.
+  if (!services.length || record.is_update_blocked) {
+    return {
+      moved: false,
+      reason: !services.length ? "no_services" : "update_blocked"
+    };
+  }
+
+  const baseComment = String(record.comment || "").trim();
+  const cancelTag = "Cancelled via Kommo (attendance -1) - not deleted";
+  const payload = {
+    staff_id: record.staff_id,
+    services: services.map((service) => ({
+      id: service.id,
+      amount: service.amount,
+      cost: service.cost
+    })),
+    datetime: record.datetime,
+    seance_length: record.seance_length,
+    attendance: -1,
+    save_if_busy: true,
+    comment: baseComment ? `${baseComment} | ${cancelTag}` : cancelTag
+  };
+
+  if (record.client?.id) {
+    payload.client = { id: record.client.id };
+  } else if (hasValue(record.client?.phone)) {
+    payload.client = {
+      phone: record.client.phone,
+      name: record.client.name || "Altegio Client"
+    };
+  }
+
+  try {
+    await axios.put(recordUrl, payload, { headers: getAltegioApiHeaders() });
+
+    return { moved: true, reason: "attendance_set_cancelled" };
+  } catch (error) {
+    console.error("ALTEGIO CANCEL STATUS UPDATE ERROR", {
+      lead_id: leadId,
+      record_id: recordId,
+      company_id: companyId,
+      status: error.response?.status,
+      message: error.message,
+      data: maskAltegioTokens(error.response?.data)
+    });
+
+    return { moved: false, reason: "update_failed" };
+  }
+}
+
+// Single safe entry point for Kommo cancel/closed/deleted events. NEVER
+// deletes an Altegio record. Tries to move it to cancelled status; otherwise
+// keeps it. Adds a Kommo note (unless the lead itself was deleted).
+async function handleKommoCancelKeepAltegio({
+  leadId,
+  recordId,
+  companyId,
+  statusId,
+  isDeleteEvent,
+  reason
+}) {
+  const result = await moveAltegioRecordToCancelled({
+    companyId,
+    recordId,
+    leadId
+  });
+
+  let noteFn = null;
+
+  if (result.moved) {
+    console.log("ALTEGIO RECORD MOVED TO CANCELLED", {
+      lead_id: leadId,
+      record_id: recordId || null,
+      company_id: companyId || null,
+      status_id: statusId || null,
+      reason: result.reason
+    });
+    noteFn = addKommoNoteForAltegioRecordCancelled;
+  } else {
+    console.log("KOMMO CANCEL ROUTE - ALTEGIO RECORD KEPT", {
+      lead_id: leadId,
+      record_id: recordId || null,
+      company_id: companyId || null,
+      status_id: statusId || null,
+      reason: result.reason,
+      detail: "Altegio status update not applied - record preserved, not deleted"
+    });
+    console.log("ALTEGIO DELETE DISABLED", {
+      lead_id: leadId,
+      record_id: recordId || null,
+      company_id: companyId || null
+    });
+    noteFn = addKommoNoteForAltegioRecordKept;
+  }
+
+  if (!isDeleteEvent && hasValue(leadId)) {
+    try {
+      await noteFn(leadId);
+    } catch (error) {
+      console.log("KOMMO CANCEL NOTE SKIPPED:", {
+        lead_id: leadId,
+        record_id: recordId || null,
+        message: error.message
+      });
+    }
+  }
+
+  return {
+    altegioDeleted: false,
+    movedToCancelled: result.moved,
+    recordKept: true,
+    recordId: recordId || null,
+    companyId: companyId || null,
+    reason: result.reason
+  };
+}
+
 async function getKommoLeadNotes(leadId) {
   const response = await axios.get(
     `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/${leadId}/notes`,
@@ -1882,6 +2053,31 @@ async function addKommoNoteForAltegioRecordKept(leadId) {
   );
 }
 
+async function addKommoNoteForAltegioRecordCancelled(leadId) {
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: [
+            "Source: Kommo",
+            "Altegio record was moved to cancelled status, not deleted."
+          ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
 async function addKommoNoteForAltegioSlotUnavailable(bookingData, suggestions = []) {
   const lines = [
     "Source: Kommo",
@@ -1947,42 +2143,21 @@ async function syncKommoCancelToAltegio(lead, { isDeleteEvent, reason }) {
     getKommoAltegioCompanyId(enrichedLead) ||
     getKommoAltegioCompanyId(lead);
 
-  // SAFETY: never delete or cancel the Altegio record from a Kommo event.
-  console.log("KOMMO CANCEL ROUTE - ALTEGIO RECORD KEPT", {
-    lead_id: leadId,
-    record_id: recordId || null,
-    company_id: companyId || null,
-    is_delete_event: isDeleteEvent,
+  // SAFETY: never delete the Altegio record. Best-effort move to cancelled,
+  // otherwise keep it. (Lead-deleted events skip the Kommo note internally.)
+  const result = await handleKommoCancelKeepAltegio({
+    leadId,
+    recordId,
+    companyId,
+    statusId: lead?.status_id,
+    isDeleteEvent,
     reason
   });
-  console.log("ALTEGIO DELETE DISABLED", {
-    lead_id: leadId,
-    record_id: recordId || null,
-    company_id: companyId || null,
-    reason
-  });
-
-  // Lead-deleted events have no lead left in Kommo to annotate.
-  if (!isDeleteEvent && hasValue(leadId)) {
-    try {
-      await addKommoNoteForAltegioRecordKept(leadId);
-    } catch (error) {
-      console.log("KOMMO CANCEL NOTE SKIPPED:", {
-        lead_id: leadId,
-        record_id: recordId || null,
-        message: error.message
-      });
-    }
-  }
 
   return {
     cancelled: false,
-    altegioDeleted: false,
-    recordKept: true,
     skipped: true,
-    recordId: recordId || null,
-    companyId: companyId || null,
-    reason: "Altegio deletion disabled - record kept"
+    ...result
   };
 }
 
@@ -2209,38 +2384,22 @@ async function routeKommoToAltegio({
   }
 
   if (isCancelStatus) {
-    // SAFETY: cancel/closed Kommo statuses must NEVER delete or modify the
-    // Altegio record. The record is preserved; only a Kommo note is added.
-    console.log("KOMMO CANCEL ROUTE - ALTEGIO RECORD KEPT", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId || null,
-      status_id: statusId,
-      reason: "Altegio deletion disabled - record preserved"
+    // SAFETY: cancel/closed Kommo statuses must NEVER delete the Altegio
+    // record. Best-effort move to cancelled status; otherwise keep it.
+    const cancelResult = await handleKommoCancelKeepAltegio({
+      leadId: bookingData.leadId,
+      recordId: bookingData.recordId,
+      companyId: bookingData.companyId,
+      statusId,
+      isDeleteEvent: false,
+      reason: `Kommo lead moved to cancelled status ${statusId}`
     });
-    console.log("ALTEGIO DELETE DISABLED", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId || null,
-      status_id: statusId
-    });
-
-    try {
-      await addKommoNoteForAltegioRecordKept(bookingData.leadId);
-    } catch (error) {
-      console.log("KOMMO CANCEL NOTE SKIPPED:", {
-        lead_id: bookingData.leadId,
-        record_id: bookingData.recordId || null,
-        message: error.message
-      });
-    }
 
     return {
       route,
       synced: false,
       skipped: true,
-      altegioDeleted: false,
-      recordKept: true,
-      recordId: bookingData.recordId || null,
-      reason: "Altegio deletion disabled - record kept"
+      ...cancelResult
     };
   }
 
