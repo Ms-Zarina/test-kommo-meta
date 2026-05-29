@@ -3835,6 +3835,13 @@ app.post("/altegio/webhook", async (req, res) => {
 
     let targetStatusId = null;
 
+    // attendance/visit_attendance describe whether the client showed up, which
+    // only makes sense once the appointment time has passed. A FUTURE booking
+    // with attendance -1 is stale/erroneous data and must NOT be treated as a
+    // no-show (otherwise an active booking is mis-mapped to "Отмена").
+    const recordMs = Date.parse(data?.datetime || "");
+    const recordIsPast = Number.isFinite(recordMs) && recordMs < Date.now();
+
     if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
     }
@@ -3843,13 +3850,24 @@ app.post("/altegio/webhook", async (req, res) => {
       targetStatusId = process.env.SUCCESSFULLY_STATUS_ID;
     }
 
-    if (data?.attendance === -1 || data?.visit_attendance === -1) {
+    if (
+      (data?.attendance === -1 || data?.visit_attendance === -1) &&
+      recordIsPast
+    ) {
       // Altegio cancelled/no-show -> Kommo "Отмена". Prefer a dedicated cancel
       // status if configured; fall back to CLOSED_STATUS_ID (existing behavior).
       targetStatusId =
         process.env.CANCELLED_STATUS_ID ||
         process.env.CANCEL_STATUS_ID ||
         process.env.CLOSED_STATUS_ID;
+    } else if (
+      (data?.attendance === -1 || data?.visit_attendance === -1) &&
+      !recordIsPast &&
+      !targetStatusId
+    ) {
+      // Future booking with a stale -1 and not otherwise confirmed: keep it as
+      // a booking rather than cancelling it.
+      targetStatusId = process.env.BOOKING_STATUS_ID;
     }
 
     if (!targetStatusId) {
@@ -3890,7 +3908,9 @@ app.post("/altegio/webhook", async (req, res) => {
       lead_id: lead.id,
       altegio_status: status,
       attendance: data?.attendance,
+      visit_attendance: data?.visit_attendance,
       confirmed: data?.confirmed,
+      record_is_past: recordIsPast,
       target_status_id: targetStatusId
     });
 
