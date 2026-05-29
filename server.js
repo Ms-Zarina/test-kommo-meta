@@ -2919,6 +2919,8 @@ app.post("/webhook/kommo", async (req, res) => {
     // Entry marker: proves whether Kommo actually delivered a webhook (and for
     // which event) when a field/stage changes.
     console.log("KOMMO WEBHOOK HIT", {
+      content_type: req.headers["content-type"],
+      body_keys: Object.keys(req.body || {}),
       leads_keys: Object.keys(req.body?.leads || {}),
       status_lead_id: req.body?.leads?.status?.[0]?.id,
       update_lead_id: req.body?.leads?.update?.[0]?.id
