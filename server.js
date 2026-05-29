@@ -1136,7 +1136,9 @@ function isAltegioSlotConflict(error) {
 }
 
 const recentSlotUnavailableNotes = new Map();
-const SLOT_UNAVAILABLE_NOTE_TTL_MS = 60000;
+// Short window: only collapse near-simultaneous duplicate deliveries, so a
+// legitimate re-test of the same slot still gets the alternatives note.
+const SLOT_UNAVAILABLE_NOTE_TTL_MS = 8000;
 
 async function reportAltegioSlotUnavailable(bookingData, details = {}) {
   const { payload, ...logDetails } = details;
