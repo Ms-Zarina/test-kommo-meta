@@ -3152,8 +3152,11 @@ app.post("/webhook/kommo", async (req, res) => {
       data: error.response?.data
     });
 
-    return res.status(500).json({
+    // Always acknowledge with 200 so Kommo/amoCRM does NOT auto-disable the
+    // webhook after repeated internal errors. Failures are logged above.
+    return res.status(200).json({
       ok: false,
+      handled: false,
       error: error.message
     });
   }
@@ -4042,8 +4045,11 @@ app.post("/altegio/webhook", async (req, res) => {
       data: error.response?.data
     });
 
-    return res.status(500).json({
+    // Always acknowledge with 200 so Altegio does NOT auto-disable the webhook
+    // after repeated internal errors. Failures are logged above.
+    return res.status(200).json({
       ok: false,
+      handled: false,
       error: error.message
     });
   }
