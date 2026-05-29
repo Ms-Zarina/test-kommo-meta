@@ -2916,6 +2916,14 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 app.post("/webhook/kommo", async (req, res) => {
   try {
+    // Entry marker: proves whether Kommo actually delivered a webhook (and for
+    // which event) when a field/stage changes.
+    console.log("KOMMO WEBHOOK HIT", {
+      leads_keys: Object.keys(req.body?.leads || {}),
+      status_lead_id: req.body?.leads?.status?.[0]?.id,
+      update_lead_id: req.body?.leads?.update?.[0]?.id
+    });
+
     const webhookEventType = getWebhookEventType(req.body);
     const lead =
       req.body?.leads?.status?.[0] ||
