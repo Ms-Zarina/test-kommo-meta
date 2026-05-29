@@ -1135,8 +1135,41 @@ function isAltegioSlotConflict(error) {
   );
 }
 
+const recentSlotUnavailableNotes = new Map();
+const SLOT_UNAVAILABLE_NOTE_TTL_MS = 60000;
+
 async function reportAltegioSlotUnavailable(bookingData, details = {}) {
   const { payload, ...logDetails } = details;
+
+  // Idempotent: don't add the same "slot unavailable + alternatives" note (or
+  // re-run the alternatives search) twice for the same lead+datetime.
+  const noteKey = `${bookingData.leadId}|${bookingData.datetime}`;
+  const now = Date.now();
+
+  for (const [key, ts] of recentSlotUnavailableNotes) {
+    if (now - ts > SLOT_UNAVAILABLE_NOTE_TTL_MS) {
+      recentSlotUnavailableNotes.delete(key);
+    }
+  }
+
+  const lastNoted = recentSlotUnavailableNotes.get(noteKey);
+
+  if (
+    hasValue(bookingData.leadId) &&
+    lastNoted &&
+    now - lastNoted < SLOT_UNAVAILABLE_NOTE_TTL_MS
+  ) {
+    console.log("ALTEGIO SLOT UNAVAILABLE - DUPLICATE NOTE SUPPRESSED", {
+      lead_id: bookingData.leadId,
+      datetime: bookingData.datetime,
+      ...logDetails
+    });
+    return;
+  }
+
+  if (hasValue(bookingData.leadId)) {
+    recentSlotUnavailableNotes.set(noteKey, now);
+  }
 
   console.error("ALTEGIO SLOT UNAVAILABLE", {
     lead_id: bookingData.leadId,
@@ -1598,8 +1631,32 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
       headers: getAltegioApiHeaders()
     });
     const currentRecord = current.data?.data;
+    const upToDate = currentRecord
+      ? isAltegioRecordUpToDate(currentRecord, payload)
+      : false;
 
-    if (currentRecord && isAltegioRecordUpToDate(currentRecord, payload)) {
+    console.log("CURRENT ALTEGIO RECORD SNAPSHOT", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      datetime: currentRecord?.datetime || null,
+      service_ids: (currentRecord?.services || []).map((service) => service.id),
+      staff_id: currentRecord?.staff_id || null
+    });
+    console.log("DESIRED KOMMO BOOKING SNAPSHOT", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      datetime: payload.datetime,
+      service_ids: payload.services?.map((service) => service.id),
+      staff_id: payload.staff_id
+    });
+    console.log("CHANGE DETECTION RESULT", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId,
+      up_to_date: upToDate,
+      will_update: !upToDate
+    });
+
+    if (currentRecord && upToDate) {
       console.log("ALTEGIO UPDATE SKIPPED - NO CHANGES", {
         lead_id: bookingData.leadId,
         record_id: bookingData.recordId,
@@ -2610,6 +2667,16 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
     (bookingData.serviceIds || []).join(","),
     bookingData.staffId || ""
   ].join("|");
+
+  console.log("DEDUP SIGNATURE DEBUG", {
+    lead_id: bookingData.leadId,
+    record_id: bookingData.recordId || null,
+    datetime: bookingData.datetime,
+    service_ids: bookingData.serviceIds,
+    staff_id: bookingData.staffId,
+    signature: dedupSignature,
+    dedup_window_ms: ALTEGIO_BOOKING_SYNC_DEDUP_MS
+  });
 
   if (
     hasValue(bookingData.leadId) &&
