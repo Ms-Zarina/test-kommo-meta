@@ -415,6 +415,23 @@ function getKommoCustomField(entity, namesOrIds) {
     .map((field) => String(field).trim());
   const fields = entity?.custom_fields_values || [];
 
+  // Priority 0: exact field_id match. Numeric values in namesOrIds (e.g. from
+  // KOMMO_ALTEGIO_*_FIELD_ID env vars) are the most specific - this prevents
+  // Kommo duplicate-named fields from returning the wrong one.
+  const numericRequestedIds = requestedFields.filter((value) =>
+    /^\d+$/.test(value)
+  );
+
+  if (numericRequestedIds.length) {
+    const idMatch = fields.find((field) =>
+      numericRequestedIds.includes(String(field.field_id))
+    );
+
+    if (idMatch) {
+      return idMatch;
+    }
+  }
+
   const fieldNameMatch = fields.find((field) =>
     requestedFields.some((requestedField) => field.field_name === requestedField)
   );
@@ -606,14 +623,18 @@ function mapKommoServicesToAltegioServiceIds(serviceName) {
 function extractKommoBookingData(enrichedLead, contact) {
   const { email, phone } = extractEmailAndPhone(contact || {});
   const clientName = contact?.name || "Kommo Client";
-  const datetimeField = getKommoCustomField(
-    enrichedLead,
-    KOMMO_ALTEGIO_FIELDS.datetime
-  );
-  const serviceField = getKommoCustomField(
-    enrichedLead,
-    KOMMO_ALTEGIO_FIELDS.service
-  );
+  // Pass the env-configured field ids alongside the names so a numeric ID
+  // (most specific) wins over name matching when Kommo has duplicate-named
+  // fields. KOMMO_ALTEGIO_DATETIME_FIELD_ID=1032475 forces the correct
+  // "Date and time" field for lead-23581344-style cases.
+  const datetimeField = getKommoCustomField(enrichedLead, [
+    ...KOMMO_ALTEGIO_FIELDS.datetime,
+    process.env.KOMMO_ALTEGIO_DATETIME_FIELD_ID
+  ]);
+  const serviceField = getKommoCustomField(enrichedLead, [
+    ...KOMMO_ALTEGIO_FIELDS.service,
+    process.env.KOMMO_ALTEGIO_SERVICE_FIELD_ID
+  ]);
   const rawDatetime = datetimeField?.values?.[0]?.value ?? null;
   const datetime = normalizeAltegioDatetime(rawDatetime);
   const serviceName = serviceField?.values?.[0]?.value ?? null;
@@ -3440,6 +3461,41 @@ async function handleDebugSyncKommoStatus(req, res) {
     const recordId = bookingData.recordId || null;
     const companyId = bookingData.companyId;
 
+    // Datetime field debug: dump every candidate "Date and time" field so a
+    // duplicate-named field bug is immediately visible.
+    const datetimeMatchDebug = getKommoCustomFieldMatchDebug(enrichedLead, [
+      ...KOMMO_ALTEGIO_FIELDS.datetime,
+      process.env.KOMMO_ALTEGIO_DATETIME_FIELD_ID
+    ]);
+    const datetimeMatchedField = datetimeMatchDebug.matched;
+    const datetimeRawValue = datetimeMatchedField?.values?.[0]?.value ?? null;
+    const datetimeValueType = typeof datetimeRawValue;
+    const datetimeAllCandidates = (enrichedLead?.custom_fields_values || [])
+      .filter((field) =>
+        String(field.field_name || "")
+          .toLowerCase()
+          .includes("date")
+      )
+      .map((field) => ({
+        field_id: field.field_id,
+        field_name: field.field_name,
+        field_code: field.field_code,
+        values: field.values
+      }));
+
+    console.log("DEBUG MANUAL KOMMO STATUS SYNC - DATETIME FIELD", {
+      lead_id: leadId,
+      env_datetime_field_id: process.env.KOMMO_ALTEGIO_DATETIME_FIELD_ID,
+      matched_field_id: datetimeMatchedField?.field_id,
+      matched_field_name: datetimeMatchedField?.field_name,
+      matched_values: datetimeMatchedField?.values,
+      raw_value: datetimeRawValue,
+      value_type: datetimeValueType,
+      extracted_datetime: bookingData.datetime,
+      all_date_like_candidates: datetimeAllCandidates,
+      duplicate_count: datetimeAllCandidates.length
+    });
+
     const bookingStatusId = process.env.BOOKING_STATUS_ID;
     const successStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
     const closedStatusId = process.env.CLOSED_STATUS_ID || "143";
@@ -3532,7 +3588,16 @@ async function handleDebugSyncKommoStatus(req, res) {
       reason,
       noted,
       note_error: noteError,
-      suggestions
+      suggestions,
+      datetime: {
+        raw_value: datetimeRawValue,
+        value_type: datetimeValueType,
+        extracted: bookingData.datetime,
+        matched_field_id: datetimeMatchedField?.field_id || null,
+        matched_field_name: datetimeMatchedField?.field_name || null,
+        duplicate_count: datetimeAllCandidates.length,
+        all_date_like_candidates: datetimeAllCandidates
+      }
     };
 
     console.log("DEBUG MANUAL KOMMO STATUS SYNC END", out);
