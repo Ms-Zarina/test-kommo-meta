@@ -4026,17 +4026,21 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
-    // Status mapping priority (no-show wins over confirmed, because
-    // confirmed=1 is set on the original booking and stays set even after the
-    // client is marked as no-show):
-    //   1. attendance/visit_attendance === -1  -> Closed Lost (no-show)
-    //   2. attendance/visit_attendance === 1   -> Successfully completed
+    // Dynamic status mapping (re-evaluated on every Altegio update, so the
+    // Kommo lead follows the latest record state both ways - e.g. no-show ->
+    // came moves Kommo back to Successfully Completed).
+    // Priority:
+    //   1. attendance/visit_attendance === 1   -> Successfully (client came)
+    //   2. attendance/visit_attendance === -1  -> Closed Lost (no-show)
     //   3. confirmed === 1 or status "create"  -> Booking
     //   4. otherwise                            -> no status change
     let targetStatusId = null;
     let selectedReason = "no_match";
 
-    if (data?.attendance === -1 || data?.visit_attendance === -1) {
+    if (data?.attendance === 1 || data?.visit_attendance === 1) {
+      targetStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
+      selectedReason = "client_came";
+    } else if (data?.attendance === -1 || data?.visit_attendance === -1) {
       targetStatusId = process.env.CLOSED_STATUS_ID || "143";
       selectedReason = "no_show_closed_lost";
 
@@ -4045,12 +4049,9 @@ app.post("/altegio/webhook", async (req, res) => {
         record_id: data?.id || data?.record_id || null,
         target_status_id: targetStatusId
       });
-    } else if (data?.attendance === 1 || data?.visit_attendance === 1) {
-      targetStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
-      selectedReason = "successfully_completed";
     } else if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
-      selectedReason = "booking_confirmed";
+      selectedReason = "confirmed_booking";
     }
 
     console.log("ALTEGIO STATUS MAPPING DEBUG", {
