@@ -846,6 +846,11 @@ async function buildAltegioRecordPayload({ bookingData, includeClient }) {
     seance_length: seanceLength,
     length: seanceLength,
     datetime: bookingData.datetime,
+    // Kommo BOOKING is the source of truth for an active booking: attendance
+    // resets to 0 (waiting), confirmed:1. Altegio ignores unknown fields if
+    // PUT semantics differ; harmless on the create POST.
+    attendance: 0,
+    confirmed: 1,
     save_if_busy: false,
     comment: `Created from Kommo lead ${bookingData.leadId}`,
     api_id: `kommo_lead_${bookingData.leadId}`
@@ -1583,7 +1588,12 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     throw new Error("Altegio record creation returned no record ID");
   }
 
-  markRecentKommoToAltegioWrite(record.id);
+  markSourceTruth({
+    source: "kommo",
+    recordId: record.id,
+    leadId: bookingData.leadId,
+    extra: { kind: "create" }
+  });
 
   return {
     recordId: record.id,
@@ -1642,17 +1652,8 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     });
     const currentRecord = current.data?.data;
 
-    // Kommo admin source-of-truth: if the Altegio record has a stale no-show
-    // flag (attendance/visit_attendance === -1) and Kommo is re-booking it,
-    // reset attendance to 0 (active/waiting) so the booking is no longer
-    // marked as a no-show. attendance:0 is NOT a delete and is allowed.
-    if (
-      currentRecord &&
-      (Number(currentRecord.attendance) === -1 ||
-        Number(currentRecord.visit_attendance) === -1)
-    ) {
-      payload.attendance = 0;
-    }
+    // attendance:0 + confirmed:1 are already in the booking payload (Kommo
+    // BOOKING is source-of-truth for an active booking). No extra reset needed.
 
     const upToDate = currentRecord
       ? isAltegioRecordUpToDate(currentRecord, payload)
@@ -1789,7 +1790,12 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     seance_length: payload.seance_length
   });
 
-  markRecentKommoToAltegioWrite(record?.id || bookingData.recordId);
+  markSourceTruth({
+    source: "kommo",
+    recordId: record?.id || bookingData.recordId,
+    leadId: bookingData.leadId,
+    extra: { kind: "update" }
+  });
 
   return {
     recordId: record?.id || bookingData.recordId,
@@ -1969,6 +1975,149 @@ async function moveAltegioRecordToCancelled({ companyId, recordId, leadId }) {
     });
 
     return { moved: false, reason: "update_failed" };
+  }
+}
+
+// Status-only sync from Kommo to Altegio for manual admin status changes
+// (142 -> came/attendance:1, 143 -> no-show/attendance:-1). Preserves every
+// other field of the record by reconstructing the PUT payload from the
+// current GET. NEVER calls DELETE; this is not a cancellation path.
+async function syncKommoStatusToAltegio({
+  companyId,
+  recordId,
+  leadId,
+  attendance,
+  confirmed
+}) {
+  console.log("KOMMO STATUS -> ALTEGIO STATUS SYNC START", {
+    lead_id: leadId,
+    record_id: recordId,
+    attendance,
+    confirmed: confirmed === undefined ? null : confirmed
+  });
+
+  if (!companyId || !recordId) {
+    return { ok: false, reason: "missing_ids" };
+  }
+
+  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
+    .replace(/\/$/, "");
+  const recordUrl = `${apiUrl}/api/v1/record/${companyId}/${recordId}`;
+  let record;
+
+  try {
+    const response = await axios.get(recordUrl, {
+      headers: getAltegioApiHeaders()
+    });
+    record = response.data?.data;
+  } catch (error) {
+    if (error.response?.status === 404) {
+      console.log("ALTEGIO RECORD ALREADY MISSING", {
+        lead_id: leadId,
+        record_id: recordId
+      });
+      return { ok: false, reason: "record_missing" };
+    }
+    console.error("KOMMO STATUS SYNC FETCH ERROR", {
+      lead_id: leadId,
+      record_id: recordId,
+      status: error.response?.status,
+      message: error.message
+    });
+    return { ok: false, reason: "fetch_failed" };
+  }
+
+  if (!record || record.deleted) {
+    return { ok: false, reason: "record_missing" };
+  }
+
+  const services = Array.isArray(record.services) ? record.services : [];
+
+  if (!services.length || record.is_update_blocked) {
+    return {
+      ok: false,
+      reason: !services.length ? "no_services" : "update_blocked"
+    };
+  }
+
+  const alreadyMatches =
+    Number(record.attendance) === Number(attendance) &&
+    (confirmed === undefined || Number(record.confirmed) === Number(confirmed));
+
+  if (alreadyMatches) {
+    console.log("KOMMO STATUS -> ALTEGIO STATUS SYNC DONE", {
+      lead_id: leadId,
+      record_id: recordId,
+      attendance,
+      unchanged: true
+    });
+    // Still mark source so a near-immediate Altegio echo doesn't pull Kommo
+    // back, even though we didn't actually PUT.
+    markSourceTruth({
+      source: "kommo",
+      recordId,
+      leadId,
+      extra: { kind: "status_sync", attendance, unchanged: true }
+    });
+    return { ok: true, unchanged: true, attendance };
+  }
+
+  const payload = {
+    staff_id: record.staff_id,
+    services: services.map((service) => ({
+      id: service.id,
+      amount: service.amount,
+      cost: service.cost
+    })),
+    datetime: record.datetime,
+    seance_length: record.seance_length,
+    attendance: Number(attendance),
+    save_if_busy: true,
+    comment: record.comment || ""
+  };
+
+  if (confirmed !== undefined) {
+    payload.confirmed = Number(confirmed);
+  }
+
+  if (record.client?.id) {
+    payload.client = { id: record.client.id };
+  } else if (hasValue(record.client?.phone)) {
+    payload.client = {
+      phone: record.client.phone,
+      name: record.client.name || "Altegio Client"
+    };
+  }
+
+  try {
+    await axios.put(recordUrl, payload, { headers: getAltegioApiHeaders() });
+
+    markSourceTruth({
+      source: "kommo",
+      recordId,
+      leadId,
+      extra: { kind: "status_sync", attendance }
+    });
+
+    console.log("KOMMO STATUS -> ALTEGIO STATUS SYNC DONE", {
+      lead_id: leadId,
+      record_id: recordId,
+      attendance,
+      confirmed: confirmed === undefined ? null : confirmed
+    });
+
+    return { ok: true, attendance };
+  } catch (error) {
+    console.error("KOMMO STATUS SYNC PUT ERROR", {
+      lead_id: leadId,
+      record_id: recordId,
+      status: error.response?.status,
+      message: error.message,
+      validation_errors: JSON.stringify(
+        error.response?.data?.meta?.errors ?? error.response?.data?.errors ?? null
+      )
+    });
+    return { ok: false, reason: "update_failed" };
   }
 }
 
@@ -2640,6 +2789,46 @@ async function routeKommoToAltegio({
     };
   }
 
+  // Kommo manual status -> Altegio status sync (142 came, 143 no-show).
+  // Routed BEFORE the legacy cancel branch so 143 writes attendance:-1 as a
+  // status sync (not a destructive cancel).
+  const successStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
+  const closedStatusId = process.env.CLOSED_STATUS_ID || "143";
+  const isCameStatus = String(statusId) === String(successStatusId);
+  const isClosedLostStatus = String(statusId) === String(closedStatusId);
+
+  if (isCameStatus || isClosedLostStatus) {
+    if (!hasValue(bookingData.recordId)) {
+      console.log("KOMMO STATUS SYNC SKIPPED - NO RECORD ID", {
+        lead_id: bookingData.leadId,
+        status_id: statusId
+      });
+      return {
+        route: "status_sync",
+        synced: false,
+        skipped: true,
+        reason: "missing_record_id"
+      };
+    }
+
+    const desiredAttendance = isCameStatus ? 1 : -1;
+    const result = await syncKommoStatusToAltegio({
+      companyId: bookingData.companyId,
+      recordId: bookingData.recordId,
+      leadId: bookingData.leadId,
+      attendance: desiredAttendance
+    });
+
+    return {
+      route: "status_sync",
+      synced: Boolean(result?.ok),
+      action: result?.ok ? (result.unchanged ? "unchanged" : "status_updated") : "skipped",
+      reason: result?.ok ? (result.unchanged ? "no_changes" : "status_synced") : (result?.reason || "skipped"),
+      recordId: bookingData.recordId,
+      attendance: desiredAttendance
+    };
+  }
+
   if (isCancelStatus) {
     // SAFETY: cancel/closed Kommo statuses must NEVER delete the Altegio
     // record. Best-effort move to cancelled status; otherwise keep it.
@@ -2675,32 +2864,106 @@ async function routeKommoToAltegio({
   };
 }
 
-// Echo suppression: when we just wrote a record from Kommo, ignore the
-// Altegio echo for that record briefly so a stale state (e.g. a previous
-// no-show flag still reflected in the echo) cannot pull Kommo back.
-const recentKommoToAltegioWrites = new Map();
-const KOMMO_TO_ALTEGIO_ECHO_TTL_MS = 15000;
+// Bidirectional source-of-truth guard. After a status sync is written from
+// one system to the other, the destination webhook for the same record/lead
+// within SOURCE_TRUTH_TTL_MS is treated as an echo and suppressed - so a
+// stale opposite-system event cannot flip the just-synced status back.
+const sourceTruthByRecord = new Map();
+const sourceTruthByLead = new Map();
+const SOURCE_TRUTH_TTL_MS = 30000;
 
-function markRecentKommoToAltegioWrite(recordId) {
+function pruneSourceTruthMaps(now) {
+  for (const [key, value] of sourceTruthByRecord) {
+    if (now - value.timestamp > SOURCE_TRUTH_TTL_MS) sourceTruthByRecord.delete(key);
+  }
+  for (const [key, value] of sourceTruthByLead) {
+    if (now - value.timestamp > SOURCE_TRUTH_TTL_MS) sourceTruthByLead.delete(key);
+  }
+}
+
+function markSourceTruth({ source, recordId, leadId, extra }) {
+  if (!source) return;
+
+  const now = Date.now();
+  pruneSourceTruthMaps(now);
+
+  if (recordId) {
+    sourceTruthByRecord.set(String(recordId), {
+      source,
+      leadId: leadId || null,
+      timestamp: now
+    });
+  }
+  if (leadId) {
+    sourceTruthByLead.set(String(leadId), {
+      source,
+      recordId: recordId || null,
+      timestamp: now
+    });
+  }
+
+  console.log("SOURCE TRUTH SET", {
+    source,
+    record_id: recordId || null,
+    lead_id: leadId || null,
+    ttl_ms: SOURCE_TRUTH_TTL_MS,
+    ...(extra || {})
+  });
+}
+
+function sourceTruthGuardForIncoming({ incomingSource, recordId, leadId }) {
+  const now = Date.now();
+  pruneSourceTruthMaps(now);
+
+  if (recordId) {
+    const entry = sourceTruthByRecord.get(String(recordId));
+    if (
+      entry &&
+      entry.source !== incomingSource &&
+      now - entry.timestamp < SOURCE_TRUTH_TTL_MS
+    ) {
+      return { matched_by: "record_id", last_source: entry.source, last_lead_id: entry.leadId, last_record_id: recordId };
+    }
+  }
+  if (leadId) {
+    const entry = sourceTruthByLead.get(String(leadId));
+    if (
+      entry &&
+      entry.source !== incomingSource &&
+      now - entry.timestamp < SOURCE_TRUTH_TTL_MS
+    ) {
+      return { matched_by: "lead_id", last_source: entry.source, last_lead_id: leadId, last_record_id: entry.recordId };
+    }
+  }
+  return null;
+}
+
+// Debounce: Altegio sometimes flips attendance 1 -> -1 within seconds when an
+// admin corrects a no-show. Remember "client_came" recipients briefly so an
+// immediate follow-up no-show webhook can be ignored.
+const recentAltegioClientCame = new Map();
+const ALTEGIO_CLIENT_CAME_TTL_MS = 30000;
+
+function markRecentAltegioClientCame(recordId) {
   if (!recordId) return;
 
   const now = Date.now();
 
-  for (const [id, ts] of recentKommoToAltegioWrites) {
-    if (now - ts > KOMMO_TO_ALTEGIO_ECHO_TTL_MS) {
-      recentKommoToAltegioWrites.delete(id);
+  for (const [id, ts] of recentAltegioClientCame) {
+    if (now - ts > ALTEGIO_CLIENT_CAME_TTL_MS) {
+      recentAltegioClientCame.delete(id);
     }
   }
 
-  recentKommoToAltegioWrites.set(String(recordId), now);
+  recentAltegioClientCame.set(String(recordId), now);
 }
 
-function wasRecentlyWrittenFromKommo(recordId) {
+function wasRecentlyAltegioClientCame(recordId) {
   if (!recordId) return false;
 
-  const ts = recentKommoToAltegioWrites.get(String(recordId));
+  const ts = recentAltegioClientCame.get(String(recordId));
 
-  return Boolean(ts && Date.now() - ts < KOMMO_TO_ALTEGIO_ECHO_TTL_MS);
+  return Boolean(ts && Date.now() - ts < ALTEGIO_CLIENT_CAME_TTL_MS);
 }
 
 // Short-TTL dedup so duplicate/near-simultaneous Kommo webhooks for the same
@@ -3142,6 +3405,38 @@ app.post("/webhook/kommo", async (req, res) => {
       "UPDATED CUSTOM FIELDS",
       JSON.stringify(getWebhookCustomFieldsDebug(lead), null, 2)
     );
+
+    // Source-of-truth guard: if Altegio just wrote to this lead, this Kommo
+    // event is an echo of that write - ignore it for the TTL window so the
+    // bidirectional sync doesn't ping-pong.
+    const kommoSourceMatch = sourceTruthGuardForIncoming({
+      incomingSource: "kommo",
+      leadId: lead.id
+    });
+
+    if (kommoSourceMatch) {
+      console.log("KOMMO ECHO SUPPRESSED AFTER ALTEGIO UPDATE", {
+        lead_id: lead.id,
+        status_id: lead.status_id,
+        last_source: kommoSourceMatch.last_source,
+        matched_by: kommoSourceMatch.matched_by,
+        ttl_ms: SOURCE_TRUTH_TTL_MS
+      });
+      console.log("SOURCE TRUTH GUARD SKIPPED ECHO", {
+        source_incoming: "kommo",
+        source_last: kommoSourceMatch.last_source,
+        lead_id: lead.id,
+        record_id: kommoSourceMatch.last_record_id,
+        skipped_payload_status: lead.status_id
+      });
+
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "source_truth_guard",
+        lead_id: lead.id
+      });
+    }
 
     if (isDeleteEvent) {
       console.log("KOMMO EVENT DEBUG:", {
@@ -3995,25 +4290,35 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
-    // Source-of-truth guard: if we just wrote this record from Kommo, ignore
-    // the immediate Altegio echo. Otherwise a stale state (e.g. a no-show
-    // flag the admin just overrode by re-booking in Kommo) could pull the
-    // Kommo lead back to Closed Lost.
-    if (wasRecentlyWrittenFromKommo(data?.id)) {
+    // Source-of-truth guard: if Kommo just wrote this record, this Altegio
+    // event is an echo of our own write - ignore it for the TTL window.
+    const altegioSourceMatch = sourceTruthGuardForIncoming({
+      incomingSource: "altegio",
+      recordId: data?.id
+    });
+
+    if (altegioSourceMatch) {
       console.log("ALTEGIO ECHO SUPPRESSED AFTER KOMMO UPDATE", {
         record_id: data?.id,
         attendance: data?.attendance,
         visit_attendance: data?.visit_attendance,
-        ttl_ms: KOMMO_TO_ALTEGIO_ECHO_TTL_MS
+        last_source: altegioSourceMatch.last_source,
+        matched_by: altegioSourceMatch.matched_by,
+        ttl_ms: SOURCE_TRUTH_TTL_MS
       });
-      console.log("ALTEGIO WEBHOOK IGNORED - RECENT KOMMO SOURCE UPDATE", {
-        record_id: data?.id
+      console.log("SOURCE TRUTH GUARD SKIPPED ECHO", {
+        source_incoming: "altegio",
+        source_last: altegioSourceMatch.last_source,
+        record_id: data?.id,
+        lead_id: altegioSourceMatch.last_lead_id,
+        skipped_payload_status: status,
+        skipped_payload_attendance: data?.attendance
       });
 
       return res.status(200).json({
         ok: true,
         skipped: true,
-        reason: "recent_kommo_source_update",
+        reason: "source_truth_guard",
         record_id: data?.id
       });
     }
@@ -4119,6 +4424,29 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
+    // No-show debounce: if this record was just marked "client_came" within
+    // the last 30s and Altegio now sends -1, treat the -1 as a glitch and
+    // ignore it. Without this, an admin correction (1 -> -1 -> 1) can leave
+    // Kommo stuck at 143.
+    if (
+      (data?.attendance === -1 || data?.visit_attendance === -1) &&
+      wasRecentlyAltegioClientCame(data?.id)
+    ) {
+      console.log("ALTEGIO NO SHOW IGNORED AFTER RECENT CLIENT_CAME", {
+        record_id: data?.id,
+        attendance: data?.attendance,
+        visit_attendance: data?.visit_attendance,
+        debounce_ttl_ms: ALTEGIO_CLIENT_CAME_TTL_MS
+      });
+
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "no_show_ignored_after_client_came",
+        record_id: data?.id
+      });
+    }
+
     // Dynamic status mapping (re-evaluated on every Altegio update, so the
     // Kommo lead follows the latest record state both ways - e.g. no-show ->
     // came moves Kommo back to Successfully Completed).
@@ -4133,6 +4461,7 @@ app.post("/altegio/webhook", async (req, res) => {
     if (data?.attendance === 1 || data?.visit_attendance === 1) {
       targetStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
       selectedReason = "client_came";
+      markRecentAltegioClientCame(data?.id || data?.record_id);
     } else if (data?.attendance === -1 || data?.visit_attendance === -1) {
       targetStatusId = process.env.CLOSED_STATUS_ID || "143";
       selectedReason = "no_show_closed_lost";
@@ -4201,12 +4530,35 @@ app.post("/altegio/webhook", async (req, res) => {
       selected_reason: selectedReason,
       target_status_id: targetStatusId
     });
+    console.log("ALTEGIO STATUS -> KOMMO STATUS SYNC START", {
+      lead_id: lead.id,
+      record_id: data?.id || null,
+      attendance: data?.attendance,
+      visit_attendance: data?.visit_attendance,
+      target_status_id: targetStatusId
+    });
 
     const updatedLead = await updateKommoLeadFromAltegio({
       lead,
       data,
       statusId: targetStatusId,
       value: budgetValue
+    });
+
+    // Mark source-of-truth so the immediate Kommo webhook echo of this PATCH
+    // (which carries our just-written status) is suppressed.
+    markSourceTruth({
+      source: "altegio",
+      recordId: data?.id || null,
+      leadId: lead.id,
+      extra: { kind: "status_sync", target_status_id: targetStatusId }
+    });
+
+    console.log("ALTEGIO STATUS -> KOMMO STATUS SYNC DONE", {
+      lead_id: lead.id,
+      record_id: data?.id || null,
+      target_status_id: targetStatusId,
+      selected_reason: selectedReason
     });
 
     const noShowStatusId = process.env.CLOSED_STATUS_ID || "143";
