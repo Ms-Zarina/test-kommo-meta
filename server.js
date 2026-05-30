@@ -3321,6 +3321,148 @@ async function handleDebugSyncKommoLead(req, res) {
 app.get("/debug/sync-kommo-lead/:leadId", handleDebugSyncKommoLead);
 app.post("/debug/sync-kommo-lead/:leadId", handleDebugSyncKommoLead);
 
+// Manual fallback for Kommo -> Altegio STATUS sync (when Kommo's webhook
+// isn't firing on status changes). Reads the lead's current status_id and
+// routes it exactly like the production handler would:
+//   BOOKING_STATUS_ID -> full booking sync (attendance:0, confirmed:1)
+//   SUCCESSFULLY_STATUS_ID (142) -> syncKommoStatusToAltegio(attendance:1)
+//   CLOSED_STATUS_ID    (143) -> syncKommoStatusToAltegio(attendance:-1)
+// No DELETE; no destructive cancellation; Meta untouched.
+async function handleDebugSyncKommoStatus(req, res) {
+  const leadId = req.params.leadId;
+
+  console.log("DEBUG MANUAL KOMMO STATUS SYNC START", {
+    lead_id: leadId,
+    method: req.method
+  });
+
+  try {
+    const enrichedLead = await getEnrichedKommoLead(leadId);
+    const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
+    let contact = null;
+
+    if (contactId) {
+      try {
+        contact = await getContactById(contactId);
+      } catch (error) {
+        console.log("DEBUG MANUAL KOMMO STATUS SYNC - CONTACT FETCH SKIPPED", {
+          lead_id: leadId,
+          contact_id: contactId,
+          message: error.message
+        });
+      }
+    }
+
+    const bookingData = extractKommoBookingData(enrichedLead, contact);
+    const statusId = enrichedLead?.status_id;
+    const recordId = bookingData.recordId || null;
+    const companyId = bookingData.companyId;
+
+    const bookingStatusId = process.env.BOOKING_STATUS_ID;
+    const successStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
+    const closedStatusId = process.env.CLOSED_STATUS_ID || "143";
+
+    console.log("DEBUG MANUAL KOMMO STATUS SYNC - RESOLVED", {
+      lead_id: leadId,
+      status_id: statusId,
+      record_id: recordId,
+      BOOKING_STATUS_ID: bookingStatusId,
+      SUCCESSFULLY_STATUS_ID: successStatusId,
+      CLOSED_STATUS_ID: closedStatusId
+    });
+
+    let action = "skipped";
+    let reason = "unmapped_status";
+    let attendance = null;
+
+    if (String(statusId) === String(bookingStatusId)) {
+      const result = await syncKommoBookingToAltegio(enrichedLead, contact, {
+        bypassDedup: true
+      });
+      action = result?.action || "skipped";
+      reason = result?.reason || "no_result";
+      attendance = 0;
+    } else if (String(statusId) === String(successStatusId)) {
+      if (!hasValue(recordId)) {
+        action = "skipped";
+        reason = "missing_record_id";
+      } else {
+        attendance = 1;
+        const result = await syncKommoStatusToAltegio({
+          companyId,
+          recordId,
+          leadId,
+          attendance: 1
+        });
+        action = result?.ok
+          ? result.unchanged
+            ? "unchanged"
+            : "status_updated"
+          : "skipped";
+        reason = result?.ok
+          ? result.unchanged
+            ? "no_changes"
+            : "status_synced"
+          : result?.reason || "skipped";
+      }
+    } else if (String(statusId) === String(closedStatusId)) {
+      if (!hasValue(recordId)) {
+        action = "skipped";
+        reason = "missing_record_id";
+      } else {
+        attendance = -1;
+        const result = await syncKommoStatusToAltegio({
+          companyId,
+          recordId,
+          leadId,
+          attendance: -1
+        });
+        action = result?.ok
+          ? result.unchanged
+            ? "unchanged"
+            : "status_updated"
+          : "skipped";
+        reason = result?.ok
+          ? result.unchanged
+            ? "no_changes"
+            : "status_synced"
+          : result?.reason || "skipped";
+      }
+    }
+
+    const out = {
+      lead_id: leadId,
+      status_id: statusId || null,
+      record_id: recordId,
+      attendance,
+      action,
+      reason
+    };
+
+    console.log("DEBUG MANUAL KOMMO STATUS SYNC END", out);
+
+    return res.status(200).json({ ok: true, ...out });
+  } catch (error) {
+    console.error("DEBUG MANUAL KOMMO STATUS SYNC ERROR", {
+      lead_id: leadId,
+      message: error.message
+    });
+    console.log("DEBUG MANUAL KOMMO STATUS SYNC END", {
+      lead_id: leadId,
+      error: error.message
+    });
+
+    return res.status(200).json({
+      ok: false,
+      lead_id: leadId,
+      error: error.message
+    });
+  }
+}
+
+app.get("/debug/sync-kommo-status/:leadId", handleDebugSyncKommoStatus);
+app.post("/debug/sync-kommo-status/:leadId", handleDebugSyncKommoStatus);
+
 const sentEvents = new Set();
 app.post("/webhook/test-lead", async (req, res) => {
   try {
