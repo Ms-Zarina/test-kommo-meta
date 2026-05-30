@@ -3534,6 +3534,18 @@ app.post("/webhook/test-lead", async (req, res) => {
 
 app.post("/webhook/kommo", async (req, res) => {
   try {
+    // Raw entry log: ANYTHING that hits /webhook/kommo shows up here first,
+    // before every guard. Use this to confirm Kommo actually delivers the
+    // webhook (and to see exactly what it sent).
+    console.log("KOMMO WEBHOOK RAW HIT", {
+      method: req.method,
+      content_type: req.headers["content-type"],
+      body_keys: Object.keys(req.body || {}),
+      body: req.body,
+      query: req.query,
+      headers_user_agent: req.headers["user-agent"]
+    });
+
     // Entry marker: proves whether Kommo actually delivered a webhook (and for
     // which event) when a field/stage changes.
     console.log("KOMMO WEBHOOK HIT", {
@@ -3562,6 +3574,21 @@ app.post("/webhook/kommo", async (req, res) => {
       });
     }
 
+    // Shape guard: a Kommo webhook MUST have a `leads` key. If not, log and
+    // bail so we don't try to parse a foreign / empty body.
+    if (!req.body?.leads) {
+      console.error("WRONG_KOMMO_PAYLOAD_SHAPE", {
+        body_keys: Object.keys(req.body || {}),
+        content_type: req.headers["content-type"]
+      });
+
+      return res.status(200).json({
+        ok: false,
+        skipped: true,
+        reason: "WRONG_KOMMO_PAYLOAD_SHAPE"
+      });
+    }
+
     const webhookEventType = getWebhookEventType(req.body);
     const lead =
       req.body?.leads?.status?.[0] ||
@@ -3570,6 +3597,9 @@ app.post("/webhook/kommo", async (req, res) => {
     const isDeleteEvent = webhookEventType === "delete";
 
     if (!lead) {
+      console.log("KOMMO WEBHOOK - NO LEAD IN PAYLOAD", {
+        leads_keys: Object.keys(req.body?.leads || {})
+      });
       return res.json({
         ok: true,
         skipped: true,
@@ -3581,6 +3611,18 @@ app.post("/webhook/kommo", async (req, res) => {
       type: webhookEventType,
       lead_id: lead.id,
       status_id: lead.status_id
+    });
+
+    // Log the status decision BEFORE any guard, so a guard-suppressed event
+    // still leaves a record of which status arrived and what env values
+    // would have been used to route it.
+    console.log("KOMMO STATUS DEBUG", {
+      lead_id: lead.id,
+      status_id: lead.status_id,
+      status_id_type: typeof lead.status_id,
+      BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
+      SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID,
+      CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID
     });
     console.log(
       "UPDATED CUSTOM FIELDS",
@@ -3596,6 +3638,15 @@ app.post("/webhook/kommo", async (req, res) => {
     });
 
     if (kommoSourceMatch) {
+      console.log("SOURCE TRUTH GUARD BLOCKED KOMMO ROUTE", {
+        lead_id: lead.id,
+        status_id: lead.status_id,
+        last_source: kommoSourceMatch.last_source,
+        last_record_id: kommoSourceMatch.last_record_id,
+        matched_by: kommoSourceMatch.matched_by,
+        ttl_ms: SOURCE_TRUTH_TTL_MS,
+        reason: "Recent " + kommoSourceMatch.last_source + " source-of-truth write"
+      });
       console.log("KOMMO ECHO SUPPRESSED AFTER ALTEGIO UPDATE", {
         lead_id: lead.id,
         status_id: lead.status_id,
