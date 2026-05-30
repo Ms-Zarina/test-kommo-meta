@@ -2676,6 +2676,16 @@ async function routeKommoToAltegio({
   statusId
 }) {
   const bookingData = extractKommoBookingData(enrichedLead, contact);
+
+  console.log("KOMMO STATUS DEBUG", {
+    lead_id: enrichedLead?.id || webhookLead?.id,
+    status_id: statusId,
+    status_id_type: typeof statusId,
+    CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID,
+    SUCCESSFULLY_STATUS_ID: process.env.SUCCESSFULLY_STATUS_ID,
+    BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID
+  });
+
   const isBookingStatus =
     String(statusId) === String(process.env.BOOKING_STATUS_ID);
   const isThinkingStatus = isKommoThinkingStatus(statusId);
@@ -2720,6 +2730,11 @@ async function routeKommoToAltegio({
   });
 
   if (isBookingStatus) {
+    console.log("KOMMO -> ALTEGIO STATUS ROUTE MATCHED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      action: "booking_sync"
+    });
     console.log("KOMMO ADMIN BOOKING OVERRIDE START", {
       lead_id: bookingData.leadId,
       record_id: bookingData.recordId || null,
@@ -2760,6 +2775,12 @@ async function routeKommoToAltegio({
   }
 
   if (isThinkingStatus || isNoAnswerStatus) {
+    console.log("KOMMO -> ALTEGIO STATUS ROUTE MATCHED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      action: isNoAnswerStatus ? "no_answer_keep" : "thinking_keep"
+    });
+
     if (isNoAnswerStatus) {
       console.log("KOMMO NO ANSWER - ALTEGIO RECORD KEPT", {
         lead_id: bookingData.leadId,
@@ -2798,6 +2819,14 @@ async function routeKommoToAltegio({
   const isClosedLostStatus = String(statusId) === String(closedStatusId);
 
   if (isCameStatus || isClosedLostStatus) {
+    console.log("KOMMO -> ALTEGIO STATUS ROUTE MATCHED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      action: isClosedLostStatus
+        ? "status_sync_closed_lost"
+        : "status_sync_came"
+    });
+
     if (!hasValue(bookingData.recordId)) {
       console.log("KOMMO STATUS SYNC SKIPPED - NO RECORD ID", {
         lead_id: bookingData.leadId,
@@ -2830,6 +2859,11 @@ async function routeKommoToAltegio({
   }
 
   if (isCancelStatus) {
+    console.log("KOMMO -> ALTEGIO STATUS ROUTE MATCHED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      action: "cancel_keep"
+    });
     // SAFETY: cancel/closed Kommo statuses must NEVER delete the Altegio
     // record. Best-effort move to cancelled status; otherwise keep it.
     const cancelResult = await handleKommoCancelKeepAltegio({
@@ -2849,6 +2883,11 @@ async function routeKommoToAltegio({
     };
   }
 
+  console.log("KOMMO -> ALTEGIO STATUS ROUTE MATCHED", {
+    lead_id: bookingData.leadId,
+    status_id: statusId,
+    action: "no_match"
+  });
   console.log("ALTEGIO STATUS SYNC SKIPPED", {
     lead_id: bookingData.leadId,
     status_id: statusId,
