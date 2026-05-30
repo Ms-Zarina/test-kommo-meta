@@ -1122,17 +1122,22 @@ async function ensureAltegioSlotAvailable({ bookingData, payload, excludeRecordI
   });
 
   if (availability.available) {
-    return true;
+    return { available: true };
   }
 
-  await reportAltegioSlotUnavailable(bookingData, {
+  const reportResult = await reportAltegioSlotUnavailable(bookingData, {
     source: "pre_check",
     payload,
     date: availability.date,
     conflicts: availability.conflicts
   });
 
-  return false;
+  return {
+    available: false,
+    noted: reportResult?.noted ?? false,
+    noteError: reportResult?.noteError ?? null,
+    suggestions: reportResult?.suggestions ?? []
+  };
 }
 
 function isAltegioSlotConflict(error) {
@@ -1173,7 +1178,7 @@ async function reportAltegioSlotUnavailable(bookingData, details = {}) {
       datetime: bookingData.datetime,
       ...logDetails
     });
-    return;
+    return { noted: false, noteError: null, suggestions: [], deduped: true };
   }
 
   if (hasValue(bookingData.leadId)) {
@@ -1218,14 +1223,21 @@ async function reportAltegioSlotUnavailable(bookingData, details = {}) {
     }
   }
 
+  let noted = false;
+  let noteError = null;
+
   try {
     await addKommoNoteForAltegioSlotUnavailable(bookingData, suggestions);
+    noted = true;
   } catch (error) {
+    noteError = error.message || "unknown_note_error";
     console.log("KOMMO SLOT UNAVAILABLE NOTE SKIPPED:", {
       lead_id: bookingData.leadId,
-      message: error.message
+      message: noteError
     });
   }
+
+  return { noted, noteError, suggestions };
 }
 
 const ALTEGIO_ALTERNATIVE_SLOT_STEP_MIN = 30;
@@ -1525,10 +1537,16 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     seance_length: payload.seance_length
   });
 
-  const slotAvailable = await ensureAltegioSlotAvailable({ bookingData, payload });
+  const slotCheck = await ensureAltegioSlotAvailable({ bookingData, payload });
 
-  if (!slotAvailable) {
-    return { skipped: true, reason: "slot_unavailable" };
+  if (!slotCheck.available) {
+    return {
+      skipped: true,
+      reason: "slot_unavailable",
+      noted: slotCheck.noted,
+      note_error: slotCheck.noteError,
+      suggestions: slotCheck.suggestions
+    };
   }
 
   console.log(
@@ -1558,13 +1576,19 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     response = await axios.post(requestUrl, payload, requestConfig);
   } catch (error) {
     if (isAltegioSlotConflict(error)) {
-      await reportAltegioSlotUnavailable(bookingData, {
+      const reportResult = await reportAltegioSlotUnavailable(bookingData, {
         source: "altegio_409",
         payload,
         data: maskAltegioTokens(error.response?.data)
       });
 
-      return { skipped: true, reason: "slot_unavailable" };
+      return {
+        skipped: true,
+        reason: "slot_unavailable",
+        noted: reportResult?.noted ?? false,
+        note_error: reportResult?.noteError ?? null,
+        suggestions: reportResult?.suggestions ?? []
+      };
     }
 
     console.error("ALTEGIO RESPONSE ERROR:", {
@@ -1720,14 +1744,20 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     seance_length: payload.seance_length
   });
 
-  const slotAvailable = await ensureAltegioSlotAvailable({
+  const slotCheck = await ensureAltegioSlotAvailable({
     bookingData,
     payload,
     excludeRecordId: bookingData.recordId
   });
 
-  if (!slotAvailable) {
-    return { skipped: true, reason: "slot_unavailable" };
+  if (!slotCheck.available) {
+    return {
+      skipped: true,
+      reason: "slot_unavailable",
+      noted: slotCheck.noted,
+      note_error: slotCheck.noteError,
+      suggestions: slotCheck.suggestions
+    };
   }
 
   const requestConfig = {
@@ -1748,13 +1778,19 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     response = await axios.put(requestUrl, payload, requestConfig);
   } catch (error) {
     if (isAltegioSlotConflict(error)) {
-      await reportAltegioSlotUnavailable(bookingData, {
+      const reportResult = await reportAltegioSlotUnavailable(bookingData, {
         source: "altegio_409",
         payload,
         data: maskAltegioTokens(error.response?.data)
       });
 
-      return { skipped: true, reason: "slot_unavailable" };
+      return {
+        skipped: true,
+        reason: "slot_unavailable",
+        noted: reportResult?.noted ?? false,
+        note_error: reportResult?.noteError ?? null,
+        suggestions: reportResult?.suggestions ?? []
+      };
     }
 
     console.error("ALTEGIO RECORD UPDATE ERROR:", {
@@ -2471,35 +2507,66 @@ async function addKommoNoteForAltegioSlotUnavailable(bookingData, suggestions = 
   const lines = [
     "Source: Kommo",
     "Selected Altegio slot unavailable.",
-    `Requested: ${bookingData.datetime || "Not specified"}, Staff ID: ${bookingData.staffId || "Not specified"}`
+    `Requested: ${bookingData.datetime || "Not specified"}`,
+    `Service: ${bookingData.serviceName || "Not specified"}`,
+    `Staff ID: ${bookingData.staffId || "Not specified"}`
   ];
 
   if (suggestions.length) {
     lines.push("Available alternatives:");
-    suggestions.forEach((slot, index) => {
+    suggestions.slice(0, 5).forEach((slot, index) => {
       lines.push(`${index + 1}) ${slot.date} ${slot.time}, Staff ID: ${slot.staff_id}`);
     });
   }
 
-  await axios.post(
-    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
-    [
+  const url = `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`;
+
+  console.log("KOMMO SLOT ALTERNATIVES NOTE START", {
+    lead_id: bookingData.leadId,
+    url,
+    suggestion_count: suggestions.length,
+    has_kommo_token: Boolean(process.env.KOMMO_ACCESS_TOKEN),
+    has_kommo_subdomain: Boolean(process.env.KOMMO_SUBDOMAIN)
+  });
+
+  try {
+    const response = await axios.post(
+      url,
+      [
+        {
+          entity_id: Number(bookingData.leadId),
+          note_type: "common",
+          params: {
+            text: lines.join("\n")
+          }
+        }
+      ],
       {
-        entity_id: Number(bookingData.leadId),
-        note_type: "common",
-        params: {
-          text: lines.join("\n")
+        headers: {
+          Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+          Accept: "application/json"
         }
       }
-    ],
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-        Accept: "application/json"
-      }
-    }
-  );
+    );
+
+    console.log("KOMMO SLOT ALTERNATIVES NOTE DONE", {
+      lead_id: bookingData.leadId,
+      status: response.status,
+      response_keys: Object.keys(response.data || {}),
+      note_count: response.data?._embedded?.notes?.length || 0
+    });
+  } catch (error) {
+    console.error("KOMMO SLOT ALTERNATIVES NOTE ERROR", {
+      lead_id: bookingData.leadId,
+      url,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      message: error.message
+    });
+    throw error;
+  }
 }
 
 async function syncKommoCancelToAltegio(lead, { isDeleteEvent, reason }) {
@@ -3156,7 +3223,10 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
       return logKommoSyncResult({
         ...base,
         action: "skipped",
-        reason: updateResult.reason || "slot_unavailable"
+        reason: updateResult.reason || "slot_unavailable",
+        noted: updateResult.noted,
+        note_error: updateResult.note_error,
+        suggestions: updateResult.suggestions
       });
     }
 
@@ -3203,7 +3273,10 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
     return logKommoSyncResult({
       ...base,
       action: "skipped",
-      reason: createdRecord.reason || "slot_unavailable"
+      reason: createdRecord.reason || "slot_unavailable",
+      noted: createdRecord.noted,
+      note_error: createdRecord.note_error,
+      suggestions: createdRecord.suggestions
     });
   }
 
@@ -3302,8 +3375,15 @@ async function handleDebugSyncKommoLead(req, res) {
       record_id: bookingData.recordId || null,
       route: "booking",
       action: result?.action || null,
-      reason: result?.reason || null
+      reason: result?.reason || null,
+      noted: result?.noted ?? null,
+      note_error: result?.note_error ?? null,
+      suggestions: result?.suggestions || []
     };
+
+    if (result?.reason === "slot_unavailable" && result?.note_error) {
+      out.reason = "slot_unavailable_note_failed";
+    }
 
     console.log("DEBUG MANUAL KOMMO SYNC END", out);
 
@@ -3376,6 +3456,9 @@ async function handleDebugSyncKommoStatus(req, res) {
     let action = "skipped";
     let reason = "unmapped_status";
     let attendance = null;
+    let noted = null;
+    let noteError = null;
+    let suggestions = [];
 
     if (String(statusId) === String(bookingStatusId)) {
       const result = await syncKommoBookingToAltegio(enrichedLead, contact, {
@@ -3384,6 +3467,14 @@ async function handleDebugSyncKommoStatus(req, res) {
       action = result?.action || "skipped";
       reason = result?.reason || "no_result";
       attendance = 0;
+      if (result?.reason === "slot_unavailable") {
+        noted = result.noted ?? null;
+        noteError = result.note_error ?? null;
+        suggestions = result.suggestions || [];
+        if (noteError) {
+          reason = "slot_unavailable_note_failed";
+        }
+      }
     } else if (String(statusId) === String(successStatusId)) {
       if (!hasValue(recordId)) {
         action = "skipped";
@@ -3438,7 +3529,10 @@ async function handleDebugSyncKommoStatus(req, res) {
       record_id: recordId,
       attendance,
       action,
-      reason
+      reason,
+      noted,
+      note_error: noteError,
+      suggestions
     };
 
     console.log("DEBUG MANUAL KOMMO STATUS SYNC END", out);
