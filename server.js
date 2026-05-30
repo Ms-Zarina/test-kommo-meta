@@ -1583,6 +1583,8 @@ async function createAltegioRecordFromKommo({ bookingData }) {
     throw new Error("Altegio record creation returned no record ID");
   }
 
+  markRecentKommoToAltegioWrite(record.id);
+
   return {
     recordId: record.id,
     visitId: record.visit_id || null,
@@ -1611,7 +1613,13 @@ function isAltegioRecordUpToDate(record, payload) {
 
   const sameStaff = String(record?.staff_id) === String(payload?.staff_id);
 
-  return Boolean(sameDatetime && sameServices && sameStaff);
+  // Only compare attendance when payload explicitly sets it (e.g. when we are
+  // resetting a stale -1 to 0 as part of a Kommo admin re-booking).
+  const sameAttendance =
+    !Object.prototype.hasOwnProperty.call(payload || {}, "attendance") ||
+    Number(record?.attendance) === Number(payload.attendance);
+
+  return Boolean(sameDatetime && sameServices && sameStaff && sameAttendance);
 }
 
 async function updateAltegioRecordFromKommo({ bookingData }) {
@@ -1633,6 +1641,19 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
       headers: getAltegioApiHeaders()
     });
     const currentRecord = current.data?.data;
+
+    // Kommo admin source-of-truth: if the Altegio record has a stale no-show
+    // flag (attendance/visit_attendance === -1) and Kommo is re-booking it,
+    // reset attendance to 0 (active/waiting) so the booking is no longer
+    // marked as a no-show. attendance:0 is NOT a delete and is allowed.
+    if (
+      currentRecord &&
+      (Number(currentRecord.attendance) === -1 ||
+        Number(currentRecord.visit_attendance) === -1)
+    ) {
+      payload.attendance = 0;
+    }
+
     const upToDate = currentRecord
       ? isAltegioRecordUpToDate(currentRecord, payload)
       : false;
@@ -1642,7 +1663,9 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
       record_id: bookingData.recordId,
       datetime: currentRecord?.datetime || null,
       service_ids: (currentRecord?.services || []).map((service) => service.id),
-      staff_id: currentRecord?.staff_id || null
+      staff_id: currentRecord?.staff_id || null,
+      attendance: currentRecord?.attendance,
+      visit_attendance: currentRecord?.visit_attendance
     });
     console.log("DESIRED KOMMO BOOKING SNAPSHOT", {
       lead_id: bookingData.leadId,
@@ -1765,6 +1788,8 @@ async function updateAltegioRecordFromKommo({ bookingData }) {
     staff_id: bookingData.staffId,
     seance_length: payload.seance_length
   });
+
+  markRecentKommoToAltegioWrite(record?.id || bookingData.recordId);
 
   return {
     recordId: record?.id || bookingData.recordId,
@@ -2546,6 +2571,14 @@ async function routeKommoToAltegio({
   });
 
   if (isBookingStatus) {
+    console.log("KOMMO ADMIN BOOKING OVERRIDE START", {
+      lead_id: bookingData.leadId,
+      record_id: bookingData.recordId || null,
+      status_id: statusId,
+      datetime: bookingData.datetime,
+      service: bookingData.serviceName
+    });
+
     if (hasValue(bookingData.recordId)) {
       console.log("KOMMO TO ALTEGIO UPDATE START", {
         lead_id: bookingData.leadId,
@@ -2558,6 +2591,15 @@ async function routeKommoToAltegio({
     }
 
     const syncResult = await syncKommoBookingToAltegio(enrichedLead, contact);
+
+    if (syncResult?.action === "created" || syncResult?.action === "updated") {
+      console.log("KOMMO ADMIN BOOKING OVERRIDE APPLIED", {
+        lead_id: bookingData.leadId,
+        record_id: syncResult?.record_id || bookingData.recordId || null,
+        action: syncResult.action,
+        datetime: bookingData.datetime
+      });
+    }
 
     return {
       route,
@@ -2631,6 +2673,34 @@ async function routeKommoToAltegio({
     skipped: true,
     reason: "not_booking_status"
   };
+}
+
+// Echo suppression: when we just wrote a record from Kommo, ignore the
+// Altegio echo for that record briefly so a stale state (e.g. a previous
+// no-show flag still reflected in the echo) cannot pull Kommo back.
+const recentKommoToAltegioWrites = new Map();
+const KOMMO_TO_ALTEGIO_ECHO_TTL_MS = 15000;
+
+function markRecentKommoToAltegioWrite(recordId) {
+  if (!recordId) return;
+
+  const now = Date.now();
+
+  for (const [id, ts] of recentKommoToAltegioWrites) {
+    if (now - ts > KOMMO_TO_ALTEGIO_ECHO_TTL_MS) {
+      recentKommoToAltegioWrites.delete(id);
+    }
+  }
+
+  recentKommoToAltegioWrites.set(String(recordId), now);
+}
+
+function wasRecentlyWrittenFromKommo(recordId) {
+  if (!recordId) return false;
+
+  const ts = recentKommoToAltegioWrites.get(String(recordId));
+
+  return Boolean(ts && Date.now() - ts < KOMMO_TO_ALTEGIO_ECHO_TTL_MS);
 }
 
 // Short-TTL dedup so duplicate/near-simultaneous Kommo webhooks for the same
@@ -3922,6 +3992,29 @@ app.post("/altegio/webhook", async (req, res) => {
         ok: true,
         skipped: true,
         reason: "Not a record event"
+      });
+    }
+
+    // Source-of-truth guard: if we just wrote this record from Kommo, ignore
+    // the immediate Altegio echo. Otherwise a stale state (e.g. a no-show
+    // flag the admin just overrode by re-booking in Kommo) could pull the
+    // Kommo lead back to Closed Lost.
+    if (wasRecentlyWrittenFromKommo(data?.id)) {
+      console.log("ALTEGIO ECHO SUPPRESSED AFTER KOMMO UPDATE", {
+        record_id: data?.id,
+        attendance: data?.attendance,
+        visit_attendance: data?.visit_attendance,
+        ttl_ms: KOMMO_TO_ALTEGIO_ECHO_TTL_MS
+      });
+      console.log("ALTEGIO WEBHOOK IGNORED - RECENT KOMMO SOURCE UPDATE", {
+        record_id: data?.id
+      });
+
+      return res.status(200).json({
+        ok: true,
+        skipped: true,
+        reason: "recent_kommo_source_update",
+        record_id: data?.id
       });
     }
 
