@@ -2041,143 +2041,17 @@ async function moveAltegioRecordToCancelled({ companyId, recordId, leadId }) {
 // (142 -> came/attendance:1, 143 -> no-show/attendance:-1). Preserves every
 // other field of the record by reconstructing the PUT payload from the
 // current GET. NEVER calls DELETE; this is not a cancellation path.
-async function syncKommoStatusToAltegio({
-  companyId,
-  recordId,
-  leadId,
-  attendance,
-  confirmed
-}) {
-  console.log("KOMMO STATUS -> ALTEGIO STATUS SYNC START", {
+// ARCHITECTURE: ALTEGIO_SOURCE_OF_TRUTH. Hard-disabled. Kept defined so any
+// accidental future call returns safely without writing to Altegio.
+async function syncKommoStatusToAltegio({ recordId, leadId, attendance }) {
+  console.log("KOMMO STATUS WRITE TO ALTEGIO DISABLED", {
     lead_id: leadId,
     record_id: recordId,
-    attendance,
-    confirmed: confirmed === undefined ? null : confirmed
+    requested_attendance: attendance,
+    reason: "altegio_source_of_truth"
   });
 
-  if (!companyId || !recordId) {
-    return { ok: false, reason: "missing_ids" };
-  }
-
-  const apiUrl = (process.env.ALTEGIO_API_URL || "https://api.alteg.io")
-    .replace(/\/$/, "");
-  const recordUrl = `${apiUrl}/api/v1/record/${companyId}/${recordId}`;
-  let record;
-
-  try {
-    const response = await axios.get(recordUrl, {
-      headers: getAltegioApiHeaders()
-    });
-    record = response.data?.data;
-  } catch (error) {
-    if (error.response?.status === 404) {
-      console.log("ALTEGIO RECORD ALREADY MISSING", {
-        lead_id: leadId,
-        record_id: recordId
-      });
-      return { ok: false, reason: "record_missing" };
-    }
-    console.error("KOMMO STATUS SYNC FETCH ERROR", {
-      lead_id: leadId,
-      record_id: recordId,
-      status: error.response?.status,
-      message: error.message
-    });
-    return { ok: false, reason: "fetch_failed" };
-  }
-
-  if (!record || record.deleted) {
-    return { ok: false, reason: "record_missing" };
-  }
-
-  const services = Array.isArray(record.services) ? record.services : [];
-
-  if (!services.length || record.is_update_blocked) {
-    return {
-      ok: false,
-      reason: !services.length ? "no_services" : "update_blocked"
-    };
-  }
-
-  const alreadyMatches =
-    Number(record.attendance) === Number(attendance) &&
-    (confirmed === undefined || Number(record.confirmed) === Number(confirmed));
-
-  if (alreadyMatches) {
-    console.log("KOMMO STATUS -> ALTEGIO STATUS SYNC DONE", {
-      lead_id: leadId,
-      record_id: recordId,
-      attendance,
-      unchanged: true
-    });
-    // Still mark source so a near-immediate Altegio echo doesn't pull Kommo
-    // back, even though we didn't actually PUT.
-    markSourceTruth({
-      source: "kommo",
-      recordId,
-      leadId,
-      extra: { kind: "status_sync", attendance, unchanged: true }
-    });
-    return { ok: true, unchanged: true, attendance };
-  }
-
-  const payload = {
-    staff_id: record.staff_id,
-    services: services.map((service) => ({
-      id: service.id,
-      amount: service.amount,
-      cost: service.cost
-    })),
-    datetime: record.datetime,
-    seance_length: record.seance_length,
-    attendance: Number(attendance),
-    save_if_busy: true,
-    comment: record.comment || ""
-  };
-
-  if (confirmed !== undefined) {
-    payload.confirmed = Number(confirmed);
-  }
-
-  if (record.client?.id) {
-    payload.client = { id: record.client.id };
-  } else if (hasValue(record.client?.phone)) {
-    payload.client = {
-      phone: record.client.phone,
-      name: record.client.name || "Altegio Client"
-    };
-  }
-
-  try {
-    await axios.put(recordUrl, payload, { headers: getAltegioApiHeaders() });
-
-    markSourceTruth({
-      source: "kommo",
-      recordId,
-      leadId,
-      extra: { kind: "status_sync", attendance }
-    });
-
-    console.log("KOMMO STATUS -> ALTEGIO STATUS SYNC DONE", {
-      lead_id: leadId,
-      record_id: recordId,
-      attendance,
-      confirmed: confirmed === undefined ? null : confirmed
-    });
-
-    return { ok: true, attendance };
-  } catch (error) {
-    console.error("KOMMO STATUS SYNC PUT ERROR", {
-      lead_id: leadId,
-      record_id: recordId,
-      status: error.response?.status,
-      message: error.message,
-      validation_errors: JSON.stringify(
-        error.response?.data?.meta?.errors ?? error.response?.data?.errors ?? null
-      )
-    });
-    return { ok: false, reason: "update_failed" };
-  }
+  return { ok: false, reason: "kommo_status_write_disabled" };
 }
 
 // Single safe entry point for Kommo cancel/closed/deleted events. NEVER
@@ -2485,6 +2359,34 @@ async function addKommoNoteForAltegioRecordKept(leadId) {
           text: [
             "Source: Kommo",
             "Kommo marked as cancelled. Altegio record was NOT changed."
+          ].join("\n")
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
+// Architecture: Altegio is source of truth. Kommo edits to a lead that
+// already has an Altegio record must NOT propagate; this note tells the
+// admin where to make changes.
+async function addKommoNoteForAltegioSourceOfTruth(leadId) {
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: [
+            "Source: Kommo",
+            "This lead already has an Altegio record. Please change booking date/time/service directly in Altegio. Altegio is the source of truth for calendar."
           ].join("\n")
         }
       }
@@ -2900,9 +2802,9 @@ async function routeKommoToAltegio({
     };
   }
 
-  // Kommo manual status -> Altegio status sync (142 came, 143 no-show).
-  // Routed BEFORE the legacy cancel branch so 143 writes attendance:-1 as a
-  // status sync (not a destructive cancel).
+  // ARCHITECTURE: ALTEGIO_SOURCE_OF_TRUTH. Kommo status changes to 142
+  // (came) / 143 (closed lost) MUST NOT write attendance/status to Altegio.
+  // Status flows in only one direction now: Altegio -> Kommo.
   const successStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
   const closedStatusId = process.env.CLOSED_STATUS_ID || "143";
   const isCameStatus = String(statusId) === String(successStatusId);
@@ -2912,39 +2814,34 @@ async function routeKommoToAltegio({
     console.log("KOMMO -> ALTEGIO STATUS ROUTE MATCHED", {
       lead_id: bookingData.leadId,
       status_id: statusId,
-      action: isClosedLostStatus
-        ? "status_sync_closed_lost"
-        : "status_sync_came"
+      action: "status_write_disabled"
+    });
+    console.log("KOMMO STATUS WRITE TO ALTEGIO DISABLED", {
+      lead_id: bookingData.leadId,
+      status_id: statusId,
+      record_id: bookingData.recordId || null,
+      kind: isCameStatus ? "came_142" : "closed_lost_143",
+      reason: "altegio_source_of_truth"
     });
 
-    if (!hasValue(bookingData.recordId)) {
-      console.log("KOMMO STATUS SYNC SKIPPED - NO RECORD ID", {
-        lead_id: bookingData.leadId,
-        status_id: statusId
-      });
-      return {
-        route: "status_sync",
-        synced: false,
-        skipped: true,
-        reason: "missing_record_id"
-      };
+    if (hasValue(bookingData.leadId)) {
+      try {
+        await addKommoNoteForAltegioSourceOfTruth(bookingData.leadId);
+      } catch (error) {
+        console.log("KOMMO SOURCE-OF-TRUTH NOTE SKIPPED", {
+          lead_id: bookingData.leadId,
+          message: error.message
+        });
+      }
     }
-
-    const desiredAttendance = isCameStatus ? 1 : -1;
-    const result = await syncKommoStatusToAltegio({
-      companyId: bookingData.companyId,
-      recordId: bookingData.recordId,
-      leadId: bookingData.leadId,
-      attendance: desiredAttendance
-    });
 
     return {
       route: "status_sync",
-      synced: Boolean(result?.ok),
-      action: result?.ok ? (result.unchanged ? "unchanged" : "status_updated") : "skipped",
-      reason: result?.ok ? (result.unchanged ? "no_changes" : "status_synced") : (result?.reason || "skipped"),
-      recordId: bookingData.recordId,
-      attendance: desiredAttendance
+      synced: false,
+      skipped: true,
+      action: "skipped",
+      reason: "kommo_status_write_disabled",
+      recordId: bookingData.recordId || null
     };
   }
 
@@ -3232,49 +3129,32 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
   }
 
   if (hasValue(bookingData.recordId)) {
-    console.log("EXISTING RECORD UPDATE START", {
+    // ARCHITECTURE: ALTEGIO_SOURCE_OF_TRUTH. Once a record exists, Kommo
+    // must NOT update Altegio (no datetime/service/staff/attendance writes).
+    // Admin makes those edits in Altegio; the Altegio webhook syncs them
+    // back to Kommo.
+    console.log("KOMMO TO ALTEGIO UPDATE DISABLED - EXISTING RECORD", {
       ...base,
       company_id: bookingData.companyId,
-      staff_id: bookingData.staffId
+      staff_id: bookingData.staffId,
+      reason: "altegio_source_of_truth_existing_record"
     });
 
-    const updateResult = await updateAltegioRecordFromKommo({ bookingData });
-
-    if (updateResult?.skipped) {
-      return logKommoSyncResult({
-        ...base,
-        action: "skipped",
-        reason: updateResult.reason || "slot_unavailable",
-        noted: updateResult.noted,
-        note_error: updateResult.note_error,
-        suggestions: updateResult.suggestions
-      });
-    }
-
-    if (updateResult?.unchanged) {
-      return logKommoSyncResult({ ...base, action: "skipped", reason: "no_changes" });
-    }
-
-    try {
-      await addKommoNoteForAltegioRecordUpdated(
-        bookingData.leadId,
-        updateResult?.recordId || bookingData.recordId,
-        updateResult?.visitId || bookingData.visitId
-      );
-    } catch (error) {
-      console.log("KOMMO UPDATE NOTE FAILED:", {
-        lead_id: bookingData.leadId,
-        record_id: bookingData.recordId,
-        message: error.message
-      });
+    if (hasValue(bookingData.leadId)) {
+      try {
+        await addKommoNoteForAltegioSourceOfTruth(bookingData.leadId);
+      } catch (error) {
+        console.log("KOMMO SOURCE-OF-TRUTH NOTE SKIPPED", {
+          lead_id: bookingData.leadId,
+          message: error.message
+        });
+      }
     }
 
     return logKommoSyncResult({
       ...base,
-      action: "updated",
-      reason: "updated",
-      record_id: updateResult?.recordId || bookingData.recordId,
-      visit_id: updateResult?.visitId || bookingData.visitId || null
+      action: "skipped",
+      reason: "altegio_source_of_truth_existing_record"
     });
   }
 
@@ -3287,6 +3167,15 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
     });
     return logKommoSyncResult({ ...base, action: "skipped", reason: "record_already_exists" });
   }
+
+  console.log("KOMMO TO ALTEGIO CREATE ALLOWED", {
+    lead_id: bookingData.leadId,
+    datetime: bookingData.datetime,
+    service: bookingData.serviceName,
+    staff_id: bookingData.staffId,
+    company_id: bookingData.companyId,
+    reason: "no_existing_record_id"
+  });
 
   const createdRecord = await createAltegioRecordFromKommo({ bookingData });
 
@@ -3509,86 +3398,23 @@ async function handleDebugSyncKommoStatus(req, res) {
       CLOSED_STATUS_ID: closedStatusId
     });
 
-    let action = "skipped";
-    let reason = "unmapped_status";
-    let attendance = null;
-    let noted = null;
-    let noteError = null;
-    let suggestions = [];
-
-    if (String(statusId) === String(bookingStatusId)) {
-      const result = await syncKommoBookingToAltegio(enrichedLead, contact, {
-        bypassDedup: true
-      });
-      action = result?.action || "skipped";
-      reason = result?.reason || "no_result";
-      attendance = 0;
-      if (result?.reason === "slot_unavailable") {
-        noted = result.noted ?? null;
-        noteError = result.note_error ?? null;
-        suggestions = result.suggestions || [];
-        if (noteError) {
-          reason = "slot_unavailable_note_failed";
-        }
-      }
-    } else if (String(statusId) === String(successStatusId)) {
-      if (!hasValue(recordId)) {
-        action = "skipped";
-        reason = "missing_record_id";
-      } else {
-        attendance = 1;
-        const result = await syncKommoStatusToAltegio({
-          companyId,
-          recordId,
-          leadId,
-          attendance: 1
-        });
-        action = result?.ok
-          ? result.unchanged
-            ? "unchanged"
-            : "status_updated"
-          : "skipped";
-        reason = result?.ok
-          ? result.unchanged
-            ? "no_changes"
-            : "status_synced"
-          : result?.reason || "skipped";
-      }
-    } else if (String(statusId) === String(closedStatusId)) {
-      if (!hasValue(recordId)) {
-        action = "skipped";
-        reason = "missing_record_id";
-      } else {
-        attendance = -1;
-        const result = await syncKommoStatusToAltegio({
-          companyId,
-          recordId,
-          leadId,
-          attendance: -1
-        });
-        action = result?.ok
-          ? result.unchanged
-            ? "unchanged"
-            : "status_updated"
-          : "skipped";
-        reason = result?.ok
-          ? result.unchanged
-            ? "no_changes"
-            : "status_synced"
-          : result?.reason || "skipped";
-      }
-    }
+    // ARCHITECTURE: ALTEGIO_SOURCE_OF_TRUTH. This endpoint is now READ-ONLY -
+    // it never writes status/attendance to Altegio. The admin must change the
+    // visit status in Altegio; the Altegio webhook will sync it back to Kommo.
+    console.log("KOMMO STATUS WRITE TO ALTEGIO DISABLED", {
+      lead_id: leadId,
+      status_id: statusId,
+      record_id: recordId,
+      reason: "altegio_source_of_truth"
+    });
 
     const out = {
       lead_id: leadId,
       status_id: statusId || null,
       record_id: recordId,
-      attendance,
-      action,
-      reason,
-      noted,
-      note_error: noteError,
-      suggestions,
+      action: "skipped",
+      reason: "kommo_status_write_disabled",
+      message: "Change visit status in Altegio. Altegio is source of truth.",
       datetime: {
         raw_value: datetimeRawValue,
         value_type: datetimeValueType,
@@ -4716,6 +4542,16 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
+    console.log("ALTEGIO TO KOMMO SYNC ACTIVE", {
+      record_id: data?.id,
+      status,
+      attendance: data?.attendance,
+      visit_attendance: data?.visit_attendance,
+      confirmed: data?.confirmed,
+      staff_id: data?.staff_id,
+      datetime: data?.datetime
+    });
+
     const recordId = getAltegioRecordId(data);
     const visitId = getAltegioVisitId(data);
     const phone = data?.client?.phone;
@@ -5081,6 +4917,10 @@ app.post("/altegio/webhook", async (req, res) => {
 
 app.listen(process.env.PORT || 3000, () => {
   console.log(`Server running on port ${process.env.PORT || 3000}`);
+  console.log("ARCHITECTURE MODE: ALTEGIO_SOURCE_OF_TRUTH", {
+    summary: "Altegio is the calendar source of truth. Kommo CAN only first-create an Altegio record; updates/status writes/attendance writes are disabled.",
+    disable_altegio_delete: isAltegioDeleteDisabled()
+  });
 });
 
 
