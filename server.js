@@ -2557,12 +2557,14 @@ async function routeKommoToAltegio({
       });
     }
 
-    await syncKommoBookingToAltegio(enrichedLead, contact);
+    const syncResult = await syncKommoBookingToAltegio(enrichedLead, contact);
 
     return {
       route,
-      synced: true,
-      recordId: bookingData.recordId || null
+      synced: syncResult?.action === "created" || syncResult?.action === "updated",
+      action: syncResult?.action || null,
+      reason: syncResult?.reason || null,
+      recordId: syncResult?.record_id || bookingData.recordId || null
     };
   }
 
@@ -2620,14 +2622,14 @@ async function routeKommoToAltegio({
     lead_id: bookingData.leadId,
     status_id: statusId,
     route,
-    reason: "No Kommo to Altegio route for status"
+    reason: "not_booking_status"
   });
 
   return {
     route,
     synced: false,
     skipped: true,
-    reason: "No Kommo to Altegio route for status"
+    reason: "not_booking_status"
   };
 }
 
@@ -2659,8 +2661,19 @@ function shouldSkipDuplicateAltegioBookingSync(signature) {
   return false;
 }
 
-async function syncKommoBookingToAltegio(enrichedLead, contact) {
+function logKommoSyncResult(result) {
+  console.log("KOMMO TO ALTEGIO RESULT", result);
+  return result;
+}
+
+async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
   const bookingData = extractKommoBookingData(enrichedLead, contact);
+  const base = {
+    lead_id: bookingData.leadId || null,
+    record_id: bookingData.recordId || null,
+    datetime: bookingData.datetime || null,
+    service: bookingData.serviceName || null
+  };
 
   const dedupSignature = [
     bookingData.leadId,
@@ -2671,50 +2684,41 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
   ].join("|");
 
   console.log("DEDUP SIGNATURE DEBUG", {
-    lead_id: bookingData.leadId,
-    record_id: bookingData.recordId || null,
-    datetime: bookingData.datetime,
+    ...base,
     service_ids: bookingData.serviceIds,
     staff_id: bookingData.staffId,
     signature: dedupSignature,
-    dedup_window_ms: ALTEGIO_BOOKING_SYNC_DEDUP_MS
+    dedup_window_ms: ALTEGIO_BOOKING_SYNC_DEDUP_MS,
+    bypass_dedup: Boolean(options.bypassDedup)
   });
 
   if (
+    !options.bypassDedup &&
     hasValue(bookingData.leadId) &&
     shouldSkipDuplicateAltegioBookingSync(dedupSignature)
   ) {
     console.log("ALTEGIO SYNC SKIPPED - DUPLICATE WEBHOOK", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId || null,
+      ...base,
       signature: dedupSignature
     });
-    return;
+    return logKommoSyncResult({ ...base, action: "skipped", reason: "duplicate_webhook" });
   }
 
   console.log("KOMMO TO ALTEGIO DEBUG", {
-    lead_id: bookingData.leadId,
-    record_id: bookingData.recordId,
+    ...base,
     phone: bookingData.phone,
-    datetime: bookingData.datetime,
-    service: bookingData.serviceName,
     service_id: bookingData.serviceId,
     staff_id: bookingData.staffId,
     company_id: bookingData.companyId
   });
 
-  const missing = [];
-
-  if (!hasValue(bookingData.recordId) && !hasValue(bookingData.phone)) {
-    missing.push("phone");
-  }
+  // Single explicit skip reason, evaluated in priority order.
+  let missingReason = null;
 
   if (!hasValue(bookingData.datetime)) {
-    missing.push("datetime");
-  }
-
-  if (!bookingData.serviceId) {
-    missing.push("service_mapping");
+    missingReason = "missing_datetime";
+  } else if (!bookingData.serviceId) {
+    missingReason = "missing_service_mapping";
 
     if (bookingData.missingServices?.length) {
       console.error("ALTEGIO SERVICE MAPPING FAILED", {
@@ -2723,28 +2727,25 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
         missing_services: bookingData.missingServices
       });
     }
+  } else if (!hasValue(bookingData.recordId) && !hasValue(bookingData.phone)) {
+    missingReason = "missing_phone";
+  } else if (!bookingData.companyId) {
+    missingReason = "missing_company_id";
+  } else if (!bookingData.staffId) {
+    missingReason = "missing_staff_id";
   }
 
-  if (!bookingData.companyId) {
-    missing.push("company_id");
-  }
-
-  if (!bookingData.staffId) {
-    missing.push("staff_id");
-  }
-
-  if (missing.length) {
+  if (missingReason) {
     console.log("ALTEGIO CREATE SKIPPED - MISSING REQUIRED DATA", {
-      lead_id: bookingData.leadId,
-      missing,
-      service: bookingData.serviceName
+      ...base,
+      reason: missingReason
     });
 
     if (hasValue(bookingData.leadId)) {
       try {
         await addKommoNoteForAltegioBookingSkipped(
           bookingData.leadId,
-          missing,
+          [missingReason],
           bookingData.missingServices
         );
       } catch (error) {
@@ -2755,68 +2756,81 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
       }
     }
 
-    return;
+    return logKommoSyncResult({ ...base, action: "skipped", reason: missingReason });
   }
 
   const staffSelected = await applyAltegioStaffSelection(bookingData);
 
   if (!staffSelected) {
     console.log("ALTEGIO CREATE/UPDATE SKIPPED - NO STAFF FOR SERVICES", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId || null,
+      ...base,
       service_ids: bookingData.serviceIds
     });
-    return;
+    return logKommoSyncResult({ ...base, action: "skipped", reason: "no_staff_for_services" });
   }
 
   if (hasValue(bookingData.recordId)) {
     console.log("EXISTING RECORD UPDATE START", {
-      lead_id: bookingData.leadId,
-      record_id: bookingData.recordId,
+      ...base,
       company_id: bookingData.companyId,
-      datetime: bookingData.datetime,
-      service: bookingData.serviceName,
       staff_id: bookingData.staffId
     });
 
     const updateResult = await updateAltegioRecordFromKommo({ bookingData });
 
-    // Only note a genuine, applied update. Skip the note when the slot was
-    // unavailable (skipped - its own note was added) or when nothing changed
-    // (unchanged - avoids note spam from the webhook ping-pong).
-    if (!updateResult?.skipped && !updateResult?.unchanged) {
-      try {
-        await addKommoNoteForAltegioRecordUpdated(
-          bookingData.leadId,
-          updateResult?.recordId || bookingData.recordId,
-          updateResult?.visitId || bookingData.visitId
-        );
-      } catch (error) {
-        console.log("KOMMO UPDATE NOTE FAILED:", {
-          lead_id: bookingData.leadId,
-          record_id: bookingData.recordId,
-          message: error.message
-        });
-      }
+    if (updateResult?.skipped) {
+      return logKommoSyncResult({
+        ...base,
+        action: "skipped",
+        reason: updateResult.reason || "slot_unavailable"
+      });
     }
 
-    return;
+    if (updateResult?.unchanged) {
+      return logKommoSyncResult({ ...base, action: "skipped", reason: "no_changes" });
+    }
+
+    try {
+      await addKommoNoteForAltegioRecordUpdated(
+        bookingData.leadId,
+        updateResult?.recordId || bookingData.recordId,
+        updateResult?.visitId || bookingData.visitId
+      );
+    } catch (error) {
+      console.log("KOMMO UPDATE NOTE FAILED:", {
+        lead_id: bookingData.leadId,
+        record_id: bookingData.recordId,
+        message: error.message
+      });
+    }
+
+    return logKommoSyncResult({
+      ...base,
+      action: "updated",
+      reason: "updated",
+      record_id: updateResult?.recordId || bookingData.recordId,
+      visit_id: updateResult?.visitId || bookingData.visitId || null
+    });
   }
 
   const notes = await getKommoLeadNotes(bookingData.leadId);
 
   if (hasAltegioSourceNote(notes)) {
     console.log("ALTEGIO CREATE SKIPPED - RECORD ALREADY EXISTS", {
-      lead_id: bookingData.leadId,
+      ...base,
       reason: "Source: Altegio note found"
     });
-    return;
+    return logKommoSyncResult({ ...base, action: "skipped", reason: "record_already_exists" });
   }
 
   const createdRecord = await createAltegioRecordFromKommo({ bookingData });
 
   if (createdRecord?.skipped) {
-    return;
+    return logKommoSyncResult({
+      ...base,
+      action: "skipped",
+      reason: createdRecord.reason || "slot_unavailable"
+    });
   }
 
   await saveAltegioRecordIdToKommoLead(
@@ -2836,6 +2850,14 @@ async function syncKommoBookingToAltegio(enrichedLead, contact) {
     record_id: createdRecord.recordId,
     visit_id: createdRecord.visitId
   });
+
+  return logKommoSyncResult({
+    ...base,
+    action: "created",
+    reason: "created",
+    record_id: createdRecord.recordId,
+    visit_id: createdRecord.visitId || null
+  });
 }
 
 app.get("/", (req, res) => {
@@ -2843,6 +2865,81 @@ app.get("/", (req, res) => {
     ok: true,
     message: "Kommo → Meta backend is running"
   });
+});
+
+app.get("/debug/routes", (req, res) => {
+  res.json({
+    service: "kommo-meta-backend",
+    commit: process.env.RENDER_GIT_COMMIT || null,
+    disable_altegio_delete: isAltegioDeleteDisabled(),
+    webhooks: {
+      kommo: {
+        url: "/webhook/kommo",
+        expects: "Kommo payload: { account, leads: { status|update|delete: [...] } }"
+      },
+      altegio: {
+        url: "/altegio/webhook",
+        expects: "Altegio payload: { company_id, resource, resource_id, status, data }"
+      }
+    },
+    debug: {
+      manual_sync: "POST /debug/sync-kommo-lead/:leadId"
+    }
+  });
+});
+
+app.post("/debug/sync-kommo-lead/:leadId", async (req, res) => {
+  const leadId = req.params.leadId;
+
+  console.log("DEBUG MANUAL KOMMO SYNC START", { lead_id: leadId });
+
+  try {
+    const enrichedLead = await getEnrichedKommoLead(leadId);
+    const contactId = enrichedLead?._embedded?.contacts?.[0]?.id;
+    let contact = null;
+
+    if (contactId) {
+      try {
+        contact = await getContactById(contactId);
+      } catch (error) {
+        console.log("DEBUG MANUAL KOMMO SYNC - CONTACT FETCH SKIPPED", {
+          lead_id: leadId,
+          contact_id: contactId,
+          message: error.message
+        });
+      }
+    }
+
+    const bookingData = extractKommoBookingData(enrichedLead, contact);
+    const statusId = enrichedLead?.status_id;
+    const result = await syncKommoBookingToAltegio(enrichedLead, contact, {
+      bypassDedup: true
+    });
+
+    const out = {
+      lead_id: leadId,
+      status_id: statusId || null,
+      is_booking_status: String(statusId) === String(process.env.BOOKING_STATUS_ID),
+      datetime: bookingData.datetime || null,
+      service: bookingData.serviceName || null,
+      record_id: bookingData.recordId || null,
+      route: "booking",
+      action: result?.action || null,
+      reason: result?.reason || null
+    };
+
+    console.log("DEBUG MANUAL KOMMO SYNC END", out);
+
+    return res.status(200).json({ ok: true, ...out });
+  } catch (error) {
+    console.error("DEBUG MANUAL KOMMO SYNC ERROR", {
+      lead_id: leadId,
+      message: error.message
+    });
+    console.log("DEBUG MANUAL KOMMO SYNC END", { lead_id: leadId, error: error.message });
+
+    return res.status(200).json({ ok: false, lead_id: leadId, error: error.message });
+  }
 });
 
 const sentEvents = new Set();
@@ -2925,6 +3022,24 @@ app.post("/webhook/kommo", async (req, res) => {
       status_lead_id: req.body?.leads?.status?.[0]?.id,
       update_lead_id: req.body?.leads?.update?.[0]?.id
     });
+
+    // Route guard: an Altegio-shaped payload (resource/data, no leads) means the
+    // Altegio webhook is wrongly pointed at /webhook/kommo.
+    if (!req.body?.leads && req.body?.resource && req.body?.data) {
+      console.error("WRONG WEBHOOK ENDPOINT", {
+        endpoint: "/webhook/kommo",
+        reason: "EXPECTED_KOMMO_BUT_GOT_ALTEGIO",
+        body_keys: Object.keys(req.body || {}),
+        altegio_resource: req.body?.resource
+      });
+
+      return res.status(200).json({
+        ok: false,
+        skipped: true,
+        reason: "wrong_webhook_payload",
+        detail: "EXPECTED_KOMMO_BUT_GOT_ALTEGIO"
+      });
+    }
 
     const webhookEventType = getWebhookEventType(req.body);
     const lead =
@@ -3731,6 +3846,24 @@ function getValidPurchaseValue(data) {
 
 app.post("/altegio/webhook", async (req, res) => {
   try {
+    // Route guard: a Kommo-shaped payload (has leads) means the Kommo webhook
+    // is wrongly pointed at /altegio/webhook.
+    if (req.body?.leads) {
+      console.error("WRONG WEBHOOK ENDPOINT", {
+        endpoint: "/altegio/webhook",
+        reason: "EXPECTED_ALTEGIO_BUT_GOT_KOMMO",
+        body_keys: Object.keys(req.body || {}),
+        leads_keys: Object.keys(req.body?.leads || {})
+      });
+
+      return res.status(200).json({
+        ok: false,
+        skipped: true,
+        reason: "wrong_webhook_payload",
+        detail: "EXPECTED_ALTEGIO_BUT_GOT_KOMMO"
+      });
+    }
+
     const { resource, status, data } = req.body;
 
     console.log("ALTEGIO WEBHOOK:", JSON.stringify({
