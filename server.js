@@ -3563,6 +3563,34 @@ async function addKommoLeadNoteFromAltegio(leadId, data) {
   );
 }
 
+async function addKommoLeadNoteForAltegioNoShow(leadId, data) {
+  const noteText = [
+    "Source: Altegio",
+    "Client marked as no-show in Altegio. Lead moved to Closed Lost.",
+    `Altegio Record ID: ${data?.id || data?.record_id || "Not specified"}`
+  ].join("\n");
+
+  await axios.post(
+    `https://${process.env.KOMMO_SUBDOMAIN}.amocrm.com/api/v4/leads/notes`,
+    [
+      {
+        entity_id: Number(leadId),
+        note_type: "common",
+        params: {
+          text: noteText
+        }
+      }
+    ],
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.KOMMO_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      }
+    }
+  );
+}
+
 async function createKommoLeadFromAltegio({ data, contactId, value, statusId }) {
   const pipelineId = Number(process.env.KOMMO_PIPELINE_ID);
   const numericStatusId = Number(statusId);
@@ -3998,42 +4026,43 @@ app.post("/altegio/webhook", async (req, res) => {
       });
     }
 
+    // Status mapping priority (no-show wins over confirmed, because
+    // confirmed=1 is set on the original booking and stays set even after the
+    // client is marked as no-show):
+    //   1. attendance/visit_attendance === -1  -> Closed Lost (no-show)
+    //   2. attendance/visit_attendance === 1   -> Successfully completed
+    //   3. confirmed === 1 or status "create"  -> Booking
+    //   4. otherwise                            -> no status change
     let targetStatusId = null;
+    let selectedReason = "no_match";
 
-    // attendance/visit_attendance describe whether the client showed up, which
-    // only makes sense once the appointment time has passed. A FUTURE booking
-    // with attendance -1 is stale/erroneous data and must NOT be treated as a
-    // no-show (otherwise an active booking is mis-mapped to "Отмена").
-    const recordMs = Date.parse(data?.datetime || "");
-    const recordIsPast = Number.isFinite(recordMs) && recordMs < Date.now();
+    if (data?.attendance === -1 || data?.visit_attendance === -1) {
+      targetStatusId = process.env.CLOSED_STATUS_ID || "143";
+      selectedReason = "no_show_closed_lost";
 
-    if (status === "create" || data?.confirmed === 1) {
+      console.log("ALTEGIO NO SHOW -> KOMMO CLOSED LOST", {
+        lead_id: lead.id,
+        record_id: data?.id || data?.record_id || null,
+        target_status_id: targetStatusId
+      });
+    } else if (data?.attendance === 1 || data?.visit_attendance === 1) {
+      targetStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
+      selectedReason = "successfully_completed";
+    } else if (status === "create" || data?.confirmed === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
+      selectedReason = "booking_confirmed";
     }
 
-    if (data?.attendance === 1 || data?.visit_attendance === 1) {
-      targetStatusId = process.env.SUCCESSFULLY_STATUS_ID;
-    }
-
-    if (
-      (data?.attendance === -1 || data?.visit_attendance === -1) &&
-      recordIsPast
-    ) {
-      // Altegio cancelled/no-show -> Kommo "Отмена". Prefer a dedicated cancel
-      // status if configured; fall back to CLOSED_STATUS_ID (existing behavior).
-      targetStatusId =
-        process.env.CANCELLED_STATUS_ID ||
-        process.env.CANCEL_STATUS_ID ||
-        process.env.CLOSED_STATUS_ID;
-    } else if (
-      (data?.attendance === -1 || data?.visit_attendance === -1) &&
-      !recordIsPast &&
-      !targetStatusId
-    ) {
-      // Future booking with a stale -1 and not otherwise confirmed: keep it as
-      // a booking rather than cancelling it.
-      targetStatusId = process.env.BOOKING_STATUS_ID;
-    }
+    console.log("ALTEGIO STATUS MAPPING DEBUG", {
+      lead_id: lead.id,
+      record_id: data?.id || data?.record_id || null,
+      altegio_status: status,
+      attendance: data?.attendance,
+      visit_attendance: data?.visit_attendance,
+      confirmed: data?.confirmed,
+      selected_reason: selectedReason,
+      target_status_id: targetStatusId
+    });
 
     if (!targetStatusId) {
       const updatedLeadWithoutStatus = await updateKommoLeadFromAltegio({
@@ -4075,7 +4104,7 @@ app.post("/altegio/webhook", async (req, res) => {
       attendance: data?.attendance,
       visit_attendance: data?.visit_attendance,
       confirmed: data?.confirmed,
-      record_is_past: recordIsPast,
+      selected_reason: selectedReason,
       target_status_id: targetStatusId
     });
 
@@ -4085,6 +4114,19 @@ app.post("/altegio/webhook", async (req, res) => {
       statusId: targetStatusId,
       value: budgetValue
     });
+
+    const noShowStatusId = process.env.CLOSED_STATUS_ID || "143";
+
+    if (String(targetStatusId) === String(noShowStatusId)) {
+      try {
+        await addKommoLeadNoteForAltegioNoShow(lead.id, data);
+      } catch (error) {
+        console.log("ALTEGIO NO-SHOW NOTE SKIPPED:", {
+          lead_id: lead.id,
+          message: error.message
+        });
+      }
+    }
 
     if (String(targetStatusId) === String(process.env.SUCCESSFULLY_STATUS_ID)) {
       if (!altegioValue) {
