@@ -14,7 +14,9 @@ const ALTEGIO_SERVICE_MAP = {
   "Laserová epilace - Dolní končetiny (stehna + kolena + lýtka + nárty + prsty)": 5398154,
   "Odstranění výrůstků (nepigmentových névů), bradavic CO2": 5510171,
   "9У Odstranění mimických vrásek 1 oblast": 5510085,
-  "Konzultace s kosmetičkou": 5996480
+  "Konzultace s kosmetičkou": 5996480,
+  "Odstranění tetování QS4- malý testovací zákrok": 6987176,
+  "9У Botox": 12298407
 };
 
 const KOMMO_ALTEGIO_FIELDS = {
