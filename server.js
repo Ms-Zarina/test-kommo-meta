@@ -2888,10 +2888,13 @@ app.get("/debug/routes", (req, res) => {
   });
 });
 
-app.post("/debug/sync-kommo-lead/:leadId", async (req, res) => {
+async function handleDebugSyncKommoLead(req, res) {
   const leadId = req.params.leadId;
 
-  console.log("DEBUG MANUAL KOMMO SYNC START", { lead_id: leadId });
+  console.log("DEBUG MANUAL KOMMO SYNC START", {
+    lead_id: leadId,
+    method: req.method
+  });
 
   try {
     const enrichedLead = await getEnrichedKommoLead(leadId);
@@ -2940,7 +2943,11 @@ app.post("/debug/sync-kommo-lead/:leadId", async (req, res) => {
 
     return res.status(200).json({ ok: false, lead_id: leadId, error: error.message });
   }
-});
+}
+
+// Browser-friendly: same handler for GET and POST.
+app.get("/debug/sync-kommo-lead/:leadId", handleDebugSyncKommoLead);
+app.post("/debug/sync-kommo-lead/:leadId", handleDebugSyncKommoLead);
 
 const sentEvents = new Set();
 app.post("/webhook/test-lead", async (req, res) => {
