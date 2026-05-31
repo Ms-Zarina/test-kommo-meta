@@ -3322,7 +3322,9 @@ async function handleDebugSyncKommoLead(req, res) {
     const out = {
       lead_id: leadId,
       status_id: statusId || null,
+      pipeline_id: enrichedLead?.pipeline_id || null,
       is_booking_status: String(statusId) === String(process.env.BOOKING_STATUS_ID),
+      BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID || null,
       datetime: bookingData.datetime || null,
       service: bookingData.serviceName || null,
       record_id: bookingData.recordId || null,
@@ -4853,6 +4855,23 @@ app.post("/altegio/webhook", async (req, res) => {
       target_status_id: targetStatusId,
       selected_reason: selectedReason
     });
+
+    // Re-GET lead to verify the status was actually applied by Kommo.
+    try {
+      const verifyLead = await getEnrichedKommoLead(lead.id);
+      console.log("KOMMO STATUS VERIFY", {
+        lead_id: lead.id,
+        expected_status_id: targetStatusId,
+        actual_status_id: verifyLead?.status_id,
+        pipeline_id: verifyLead?.pipeline_id,
+        status_match: String(verifyLead?.status_id) === String(targetStatusId)
+      });
+    } catch (verifyErr) {
+      console.error("KOMMO STATUS VERIFY ERROR", {
+        lead_id: lead.id,
+        message: verifyErr.message
+      });
+    }
 
     const noShowStatusId = process.env.CLOSED_STATUS_ID || "143";
 
