@@ -2679,7 +2679,21 @@ async function routeKommoToAltegio({
   });
 
   const isBookingStatus =
+    hasValue(process.env.BOOKING_STATUS_ID) &&
     String(statusId) === String(process.env.BOOKING_STATUS_ID);
+
+  if (!isBookingStatus) {
+    console.log("KOMMO FIRST CREATE DEBUG - NOT BOOKING STATUS", {
+      lead_id: enrichedLead?.id || webhookLead?.id,
+      status_id: statusId,
+      status_id_str: String(statusId),
+      BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
+      BOOKING_STATUS_ID_str: String(process.env.BOOKING_STATUS_ID),
+      BOOKING_STATUS_ID_set: hasValue(process.env.BOOKING_STATUS_ID),
+      reason: "not_booking_status"
+    });
+  }
+
   const isThinkingStatus = isKommoThinkingStatus(statusId);
   const isNoAnswerStatus = isKommoNoAnswerStatus(statusId);
   const isCancelStatus = !isNoAnswerStatus && isKommoCancelStatus(statusId);
@@ -3063,6 +3077,21 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
     return logKommoSyncResult({ ...base, action: "skipped", reason: "duplicate_webhook" });
   }
 
+  console.log("KOMMO FIRST CREATE DEBUG", {
+    lead_id: bookingData.leadId,
+    status_id: enrichedLead?.status_id,
+    BOOKING_STATUS_ID: process.env.BOOKING_STATUS_ID,
+    record_id: bookingData.recordId || null,
+    has_record_id: hasValue(bookingData.recordId),
+    datetime: bookingData.datetime || null,
+    service: bookingData.serviceName || null,
+    service_ids: bookingData.serviceIds || [],
+    missing_services: bookingData.missingServices || [],
+    phone: bookingData.phone || null,
+    staff_id: bookingData.staffId || null,
+    company_id: bookingData.companyId || null
+  });
+
   console.log("KOMMO TO ALTEGIO DEBUG", {
     ...base,
     phone: bookingData.phone,
@@ -3123,9 +3152,10 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
   if (!staffSelected) {
     console.log("ALTEGIO CREATE/UPDATE SKIPPED - NO STAFF FOR SERVICES", {
       ...base,
-      service_ids: bookingData.serviceIds
+      service_ids: bookingData.serviceIds,
+      reason: "staff_not_found"
     });
-    return logKommoSyncResult({ ...base, action: "skipped", reason: "no_staff_for_services" });
+    return logKommoSyncResult({ ...base, action: "skipped", reason: "staff_not_found" });
   }
 
   if (hasValue(bookingData.recordId)) {
@@ -3154,7 +3184,7 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
     return logKommoSyncResult({
       ...base,
       action: "skipped",
-      reason: "altegio_source_of_truth_existing_record"
+      reason: "existing_record"
     });
   }
 
@@ -3165,19 +3195,32 @@ async function syncKommoBookingToAltegio(enrichedLead, contact, options = {}) {
       ...base,
       reason: "Source: Altegio note found"
     });
-    return logKommoSyncResult({ ...base, action: "skipped", reason: "record_already_exists" });
+    return logKommoSyncResult({ ...base, action: "skipped", reason: "existing_record" });
   }
 
   console.log("KOMMO TO ALTEGIO CREATE ALLOWED", {
     lead_id: bookingData.leadId,
     datetime: bookingData.datetime,
     service: bookingData.serviceName,
+    service_ids: bookingData.serviceIds,
     staff_id: bookingData.staffId,
     company_id: bookingData.companyId,
+    phone: bookingData.phone,
     reason: "no_existing_record_id"
   });
 
-  const createdRecord = await createAltegioRecordFromKommo({ bookingData });
+  let createdRecord;
+  try {
+    createdRecord = await createAltegioRecordFromKommo({ bookingData });
+  } catch (createErr) {
+    console.error("KOMMO FIRST CREATE ERROR", {
+      lead_id: bookingData.leadId,
+      message: createErr.message,
+      status: createErr.response?.status,
+      data: createErr.response?.data
+    });
+    return logKommoSyncResult({ ...base, action: "skipped", reason: "create_error" });
+  }
 
   if (createdRecord?.skipped) {
     return logKommoSyncResult({
@@ -4595,7 +4638,7 @@ app.post("/altegio/webhook", async (req, res) => {
     if (!lead) {
       const isBookingCreated =
         status === "create" ||
-        data?.confirmed === 1;
+        Number(data?.confirmed) === 1;
 
       if (!isBookingCreated) {
         return res.status(200).json({
@@ -4658,7 +4701,7 @@ app.post("/altegio/webhook", async (req, res) => {
     // ignore it. Without this, an admin correction (1 -> -1 -> 1) can leave
     // Kommo stuck at 143.
     if (
-      (data?.attendance === -1 || data?.visit_attendance === -1) &&
+      (Number(data?.attendance) === -1 || Number(data?.visit_attendance) === -1) &&
       wasRecentlyAltegioClientCame(data?.id)
     ) {
       console.log("ALTEGIO NO SHOW IGNORED AFTER RECENT CLIENT_CAME", {
@@ -4687,11 +4730,16 @@ app.post("/altegio/webhook", async (req, res) => {
     let targetStatusId = null;
     let selectedReason = "no_match";
 
-    if (data?.attendance === 1 || data?.visit_attendance === 1) {
+    // Use Number() coercion — Altegio may send attendance as string or number.
+    const att = Number(data?.attendance);
+    const vAtt = Number(data?.visit_attendance);
+    const conf = Number(data?.confirmed);
+
+    if (att === 1 || vAtt === 1) {
       targetStatusId = process.env.SUCCESSFULLY_STATUS_ID || "142";
       selectedReason = "client_came";
       markRecentAltegioClientCame(data?.id || data?.record_id);
-    } else if (data?.attendance === -1 || data?.visit_attendance === -1) {
+    } else if (att === -1 || vAtt === -1) {
       targetStatusId = process.env.CLOSED_STATUS_ID || "143";
       selectedReason = "no_show_closed_lost";
 
@@ -4700,10 +4748,26 @@ app.post("/altegio/webhook", async (req, res) => {
         record_id: data?.id || data?.record_id || null,
         target_status_id: targetStatusId
       });
-    } else if (status === "create" || data?.confirmed === 1) {
+    } else if (status === "create" || conf === 1) {
       targetStatusId = process.env.BOOKING_STATUS_ID;
       selectedReason = "confirmed_booking";
     }
+
+    console.log("ALTEGIO NO SHOW DEBUG", {
+      record_id: data?.id || data?.record_id || null,
+      lead_id: lead.id,
+      attendance: data?.attendance,
+      attendance_type: typeof data?.attendance,
+      attendance_num: att,
+      visit_attendance: data?.visit_attendance,
+      visit_attendance_type: typeof data?.visit_attendance,
+      visit_attendance_num: vAtt,
+      confirmed: data?.confirmed,
+      confirmed_num: conf,
+      selected_reason: selectedReason,
+      target_status_id: targetStatusId,
+      CLOSED_STATUS_ID: process.env.CLOSED_STATUS_ID || "143"
+    });
 
     console.log("ALTEGIO STATUS MAPPING DEBUG", {
       lead_id: lead.id,
