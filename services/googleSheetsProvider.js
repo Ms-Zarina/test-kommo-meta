@@ -6,10 +6,10 @@
  * *current* prices and promotions from a Google Sheet.
  *
  * Design notes:
- *  - Service-account auth is done WITHOUT the heavy `googleapis` SDK: a JWT is
- *    signed locally with `crypto` and exchanged for an access token, then the
- *    Sheets REST API is called with `axios`. So this module adds NO new npm
- *    dependency (crypto + axios are already used by the project).
+ *  - Sheets are read via the PUBLIC CSV export (gviz endpoint) with `axios` —
+ *    no Service Account, no API key, no `googleapis` SDK. This works under the
+ *    `iam.disableServiceAccountKeyCreation` org policy. The spreadsheet must be
+ *    shared as "Anyone with the link → Viewer". Only GOOGLE_SHEETS_ID is needed.
  *  - All data is cached in memory for 5 minutes. Google is never read per
  *    message.
  *  - Every failure mode is non-fatal: on any error the provider falls back to
@@ -25,7 +25,6 @@
  *  metadata:        reserved / service sheet (not loaded here)
  */
 
-const crypto = require("crypto");
 const axios = require("axios");
 
 const SHEETS = {
@@ -34,8 +33,6 @@ const SHEETS = {
 };
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const TOKEN_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly";
-const TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 let cache = {
   services: [],
@@ -80,75 +77,69 @@ function isWithinWindow(from, to, today) {
   return true;
 }
 
-function base64url(input) {
-  return Buffer.from(input)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
-
-function getPrivateKey() {
-  // Render (and most secret stores) keep the PEM on one line with literal "\n".
-  return String(process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
-}
-
 function isEnabled() {
-  return (
-    hasValue(process.env.GOOGLE_SHEETS_ID) &&
-    hasValue(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL) &&
-    hasValue(process.env.GOOGLE_PRIVATE_KEY)
-  );
+  return hasValue(process.env.GOOGLE_SHEETS_ID);
 }
 
-// ── Google auth + fetch ─────────────────────────────────────────────────────
+// ── Google Sheets public CSV transport ──────────────────────────────────────
 
-async function getAccessToken() {
-  const now = Math.floor(Date.now() / 1000);
-  const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const claim = base64url(
-    JSON.stringify({
-      iss: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      scope: TOKEN_SCOPE,
-      aud: TOKEN_URL,
-      exp: now + 3600,
-      iat: now
-    })
-  );
+// Minimal RFC-4180-ish CSV parser: handles quoted fields, escaped "" quotes
+// and newlines inside quotes. Returns an array of rows (arrays of cells).
+function parseCsv(text) {
+  const rows = [];
+  let field = "";
+  let row = [];
+  let inQuotes = false;
+  const src = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
-  const unsigned = `${header}.${claim}`;
-  const signature = crypto
-    .createSign("RSA-SHA256")
-    .update(unsigned)
-    .sign(getPrivateKey());
-  const assertion = `${unsigned}.${base64url(signature)}`;
-
-  const response = await axios.post(
-    TOKEN_URL,
-    new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion
-    }).toString(),
-    {
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      timeout: 15000
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (src[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(field);
+      field = "";
+    } else if (ch === "\n") {
+      row.push(field);
+      field = "";
+      rows.push(row);
+      row = [];
+    } else {
+      field += ch;
     }
-  );
-
-  return response.data.access_token;
+  }
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
 }
 
-async function fetchSheetValues(accessToken, sheetName) {
+// Fetch one sheet via the public CSV export. The spreadsheet must be shared as
+// "Anyone with the link → Viewer". Returns parsed rows (array of arrays).
+async function fetchSheet(sheetName) {
   const id = process.env.GOOGLE_SHEETS_ID;
-  const range = encodeURIComponent(sheetName);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${range}`;
+  const url = `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
 
   const response = await axios.get(url, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-    timeout: 15000
+    timeout: 15000,
+    responseType: "text",
+    // Keep the body as a raw string — never let axios try to JSON-parse it.
+    transformResponse: (data) => data
   });
 
-  return response.data.values || [];
+  return parseCsv(response.data);
 }
 
 function rowsToObjects(values) {
@@ -184,9 +175,7 @@ async function refreshCache() {
   refreshing = (async () => {
     if (!isEnabled()) {
       console.warn("GOOGLE_SHEETS_ENV_MISSING", {
-        hasId: hasValue(process.env.GOOGLE_SHEETS_ID),
-        hasEmail: hasValue(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL),
-        hasKey: hasValue(process.env.GOOGLE_PRIVATE_KEY)
+        hasId: hasValue(process.env.GOOGLE_SHEETS_ID)
       });
       cache = {
         services: [],
@@ -199,14 +188,13 @@ async function refreshCache() {
     }
 
     try {
-      const token = await getAccessToken();
       console.log("GOOGLE_SHEETS_CONNECTED", {
         sheetId: process.env.GOOGLE_SHEETS_ID
       });
 
       const [servicesRows, promotionsRows] = await Promise.all([
-        fetchSheetValues(token, SHEETS.services),
-        fetchSheetValues(token, SHEETS.promotions)
+        fetchSheet(SHEETS.services),
+        fetchSheet(SHEETS.promotions)
       ]);
 
       const services = rowsToObjects(servicesRows);
