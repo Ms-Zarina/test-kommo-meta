@@ -5,6 +5,11 @@ const crypto = require("crypto");
 const cors = require("cors");
 require("dotenv").config();
 
+const googleSheetsProvider = require("./services/googleSheetsProvider");
+const knowledgeProvider = require("./services/knowledgeProvider");
+const contextBuilder = require("./services/contextBuilder");
+const aiProvider = require("./services/aiProvider");
+
 const app = express();
 
 const ALTEGIO_SERVICE_MAP = {
@@ -3930,11 +3935,177 @@ app.get("/meta/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-app.post("/meta/webhook", async (req, res) => {
-  console.log("META LEAD WEBHOOK:");
-  console.log(JSON.stringify(req.body, null, 2));
+// ============================================================
+// Instagram Direct AI auto-reply (orchestration only)
+//
+// Responsibilities are split across modules:
+//   services/knowledgeProvider.js    — knowledge_base.md (read + cache)
+//   services/googleSheetsProvider.js — Sheets prices/promotions + cache
+//   services/contextBuilder.js       — merges all sources → AI context
+//   services/aiProvider.js           — LLM call (Claude today; swappable)
+// server.js only orchestrates Instagram I/O below. It does NOT touch the
+// Kommo / Altegio webhooks, status routing or record creation logic.
+// ============================================================
 
-  return res.status(200).json({ ok: true });
+const IG_GRAPH_VERSION = process.env.IG_GRAPH_VERSION || "v25.0";
+
+async function sendInstagramMessage(recipientId, text) {
+  const token = process.env.IG_PAGE_ACCESS_TOKEN;
+
+  // Dedicated Instagram messaging token — intentionally NOT META_ACCESS_TOKEN.
+  if (!hasValue(token)) {
+    console.warn("IG_PAGE_ACCESS_TOKEN_MISSING", { recipientId });
+    return { sent: false, reason: "missing_token" };
+  }
+
+  if (!hasValue(recipientId) || !hasValue(text)) {
+    console.warn("IG_REPLY_SKIPPED", {
+      reason: "missing_recipient_or_text",
+      recipientId
+    });
+    return { sent: false, reason: "missing_recipient_or_text" };
+  }
+
+  const url = `https://graph.instagram.com/${IG_GRAPH_VERSION}/me/messages`;
+
+  try {
+    const response = await axios.post(
+      url,
+      {
+        recipient: { id: recipientId },
+        message: { text: String(text) }
+      },
+      {
+        params: { access_token: token },
+        timeout: 15000
+      }
+    );
+
+    console.log("IG_REPLY_SENT", {
+      recipientId,
+      messageId: response.data?.message_id || null
+    });
+    return { sent: true, data: response.data };
+  } catch (error) {
+    console.error("IG_REPLY_ERROR", {
+      recipientId,
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data
+    });
+    return { sent: false, reason: "request_error" };
+  }
+}
+
+async function handleInstagramMessage(event) {
+  const senderId = event?.sender?.id;
+  const message = event?.message;
+  const userText = message?.text;
+
+  // Ignore echoes (messages the business account itself sent) to prevent a
+  // reply loop, and ignore non-text events (attachments, reactions, reads).
+  if (message?.is_echo) {
+    return;
+  }
+
+  if (!hasValue(senderId) || !hasValue(userText)) {
+    return;
+  }
+
+  console.log("INSTAGRAM_MESSAGE_RECEIVED", { senderId, text: userText });
+
+  // Context assembly and the LLM call are delegated to dedicated modules;
+  // server.js only wires Instagram input → reply → Instagram output.
+  const context = await contextBuilder.buildContext(userText);
+  const reply = await aiProvider.generateReply({ context, userMessage: userText });
+  await sendInstagramMessage(senderId, reply.text);
+}
+
+app.post("/meta/webhook", async (req, res) => {
+  const body = req.body || {};
+
+  console.log("META LEAD WEBHOOK:");
+  console.log(JSON.stringify(body, null, 2));
+
+  // Acknowledge immediately so Meta does not retry or time the webhook out.
+  res.status(200).json({ ok: true });
+
+  // Instagram Direct messages → AI auto-reply pipeline (fire-and-forget;
+  // every error is caught and logged inside the handler chain).
+  if (body.object === "instagram") {
+    const entries = Array.isArray(body.entry) ? body.entry : [];
+
+    for (const entry of entries) {
+      const messagingEvents = Array.isArray(entry.messaging) ? entry.messaging : [];
+
+      for (const event of messagingEvents) {
+        if (!hasValue(event?.message?.text)) {
+          continue;
+        }
+
+        handleInstagramMessage(event).catch((error) => {
+          console.error("IG_REPLY_ERROR", {
+            message: error.message,
+            stack: error.stack
+          });
+        });
+      }
+    }
+  }
+});
+
+// ── Instagram AI debug endpoints (read-only; no secrets, no full KB text) ──
+
+app.get("/debug/knowledge", (req, res) => {
+  // Never returns the full knowledge base text — only presence and size.
+  return res.status(200).json(knowledgeProvider.getStatus());
+});
+
+app.get("/debug/prices", async (req, res) => {
+  try {
+    const [services, promotions] = await Promise.all([
+      googleSheetsProvider.loadServices(),
+      googleSheetsProvider.loadPromotions()
+    ]);
+    const status = googleSheetsProvider.getCacheStatus();
+
+    return res.status(200).json({
+      services,
+      promotions,
+      source: status.source,
+      cache: status.cache,
+      updated_at: status.updated_at,
+      error: status.error
+    });
+  } catch (error) {
+    console.error("GOOGLE_SHEETS_ERROR", { message: error.message });
+    return res.status(200).json({
+      services: [],
+      promotions: [],
+      source: "fallback",
+      cache: "error",
+      error: error.message
+    });
+  }
+});
+
+app.get("/debug/ai", async (req, res) => {
+  const message = req.query.message;
+
+  if (!hasValue(message)) {
+    return res.status(400).json({ error: "missing 'message' query parameter" });
+  }
+
+  // Build the same context as the live handler (KB + Google Sheets pricing),
+  // generate a reply for testing only — never sends it to Instagram.
+  const context = await contextBuilder.buildContext(String(message));
+  const reply = await aiProvider.generateReply({ context, userMessage: String(message) });
+  return res.status(200).json({
+    message: String(message),
+    reply: reply.text,
+    source: reply.source,
+    pricing_source: googleSheetsProvider.getCacheStatus().source
+  });
 });
 
 function normalizePhone(phone) {
@@ -5004,6 +5175,12 @@ app.listen(process.env.PORT || 3000, () => {
     summary: "Altegio is the calendar source of truth. Kommo CAN only first-create an Altegio record; updates/status writes/attendance writes are disabled.",
     disable_altegio_delete: isAltegioDeleteDisabled()
   });
+
+  // Warm the Google Sheets pricing cache once at startup (best-effort; any
+  // failure is logged inside the provider and never crashes the server).
+  googleSheetsProvider
+    .refreshCache()
+    .catch((error) => console.error("GOOGLE_SHEETS_ERROR", { message: error.message }));
 });
 
 

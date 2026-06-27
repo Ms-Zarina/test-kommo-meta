@@ -1,3 +1,26 @@
 node_modules
 .env
 .netlify
+
+# Orphaned files copied from the "ALTOS AI Assistant" (RAG) project.
+# They belong to a different architecture (Qdrant/Redis/Postgres, POST /chat,
+# src/ modules that were not copied here) and are NOT part of test-kommo-meta.
+# Kept on disk for reference but excluded from commits.
+2107.1.xlsx
+regression-results.json
+run-tests.bat
+jest.config.js
+db/
+scripts/
+tests/
+GOOGLE_SHEETS_DYNAMIC_DATA_SPEC.md
+GOOGLE_SHEETS_IMPLEMENTATION_PLAN.md
+PHASE_2_ROADMAP.md
+RAG_TUNING_NOTES.md
+TEST_QUESTIONS.md
+
+# Full src/ of the other RAG project (ESM + Redis + Qdrant + Postgres + zod).
+# Incompatible with this CommonJS monolith and intentionally NOT integrated —
+# only its sheet schema/promotion semantics were mirrored into
+# services/googleSheetsProvider.js. Kept on disk for reference, excluded from commits.
+src(2)/
