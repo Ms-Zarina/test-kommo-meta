@@ -379,9 +379,61 @@ async function getActivePromotion(serviceId) {
 }
 
 /**
- * Price for one service. Priority: active promotion → services_prices override
- * → null (then the knowledge-base price stands). Inactive services return null
- * so the bot won't offer them.
+ * Resolve the live pricing situation for ONE service (pure, no I/O).
+ * price_type is one of:
+ *   - "inactive"        service switched off → do not offer
+ *   - "promotion"       an active promo price applies (authoritative)
+ *   - "override"        an emergency price override in services_prices applies
+ *   - "knowledge_base"  no Sheets price → the base price from the KB stands
+ */
+function resolveServicePricing(service, promotions, today) {
+  const serviceId = String(service.service_id || "").trim();
+  const serviceName = service.service_name || serviceId;
+  const base = { service_id: serviceId, service_name: serviceName };
+
+  if (!isServiceActive(service)) {
+    return { ...base, price_type: "inactive", is_promotion: false, price: null, currency: null, source: "inactive" };
+  }
+
+  const promo = bestActivePromotion(promotions, service, today);
+  if (promo) {
+    const p = promotionPrice(promo);
+    if (p) {
+      return {
+        ...base,
+        price_type: "promotion",
+        is_promotion: true,
+        price: p.price,
+        currency: p.currency,
+        source: "promotion",
+        promo_name: promo.promo_name || null,
+        valid_until: normalizeDate(promo.end_date),
+        gift: hasValue(promo.gift_description) ? promo.gift_description : null
+      };
+    }
+  }
+
+  const override = serviceOverridePrice(service);
+  if (override) {
+    return { ...base, price_type: "override", is_promotion: false, price: override.price, currency: override.currency, source: "override" };
+  }
+
+  return { ...base, price_type: "knowledge_base", is_promotion: false, price: null, currency: null, source: "knowledge_base" };
+}
+
+/** Resolved pricing for every service — used by the overlay and /debug/prices. */
+async function getResolvedPricing() {
+  const today = todayStr();
+  const [services, promotions] = await Promise.all([
+    loadServices(),
+    loadPromotions()
+  ]);
+  return services.map((service) => resolveServicePricing(service, promotions, today));
+}
+
+/**
+ * Price for one service. Priority: promotion → override → null (KB price).
+ * Inactive services return null so the bot won't offer them.
  */
 async function getCurrentPrice(serviceId) {
   const today = todayStr();
@@ -391,83 +443,55 @@ async function getCurrentPrice(serviceId) {
   ]);
 
   const service = findService(services, serviceId);
-  if (!service || !isServiceActive(service)) {
-    return null;
-  }
+  if (!service) return null;
 
-  const promo = bestActivePromotion(promotions, service, today);
-  if (promo) {
-    const p = promotionPrice(promo);
-    if (p) {
-      return {
-        serviceId,
-        serviceName: service.service_name || serviceId,
-        price: p.price,
-        currency: p.currency,
-        source: "promotion",
-        promoName: promo.promo_name,
-        validUntil: normalizeDate(promo.end_date),
-        gift: hasValue(promo.gift_description) ? promo.gift_description : null
-      };
-    }
-  }
-
-  const override = serviceOverridePrice(service);
-  if (override) {
+  const r = resolveServicePricing(service, promotions, today);
+  if (r.price_type === "promotion" || r.price_type === "override") {
     return {
-      serviceId,
-      serviceName: service.service_name || serviceId,
-      price: override.price,
-      currency: override.currency,
-      source: "services_prices"
+      serviceId: r.service_id,
+      serviceName: r.service_name,
+      price: r.price,
+      currency: r.currency,
+      source: r.source,
+      promoName: r.promo_name || null,
+      validUntil: r.valid_until || null,
+      gift: r.gift || null
     };
   }
 
-  return null; // no overlay → the knowledge-base price applies
+  return null; // inactive or knowledge_base → no Sheets price
 }
 
 /**
- * Build the pricing OVERLAY block for the AI prompt. It asserts only what the
- * sheet overrides: active promotions, emergency price overrides, and services
- * marked unavailable. Services with no overlay are omitted so the stable
- * knowledge-base price stands. Returns "" when there is nothing to overlay.
+ * Build the pricing OVERLAY block for the AI prompt. Each line states the
+ * price TYPE (promotion / override / inactive) so the model phrases the answer
+ * correctly. Services whose price still lives in the knowledge base are omitted
+ * (the KB price stands). Returns "" when there is nothing to overlay.
  */
 async function buildPricingContext() {
-  const today = todayStr();
-  const [services, promotions] = await Promise.all([
-    loadServices(),
-    loadPromotions()
-  ]);
-
+  const resolved = await getResolvedPricing();
   const lines = [];
 
-  for (const service of services) {
-    const name = service.service_name || service.service_id;
+  for (const r of resolved) {
+    const tag = `[service_id=${r.service_id}]`;
 
-    if (!isServiceActive(service)) {
-      lines.push(`- ${name}: currently UNAVAILABLE — do not offer or book it; let the client know politely.`);
-      continue;
+    if (r.price_type === "promotion") {
+      let line =
+        `- ${r.service_name} ${tag} — PROMOTION price: ${r.price} ${r.currency}` +
+        (r.valid_until ? `, valid until ${r.valid_until}` : "") +
+        `. price_type=promotion. This is the CURRENT price; also tell the client the regular base price from the knowledge base.`;
+      if (r.gift) line += ` Gift: ${r.gift}.`;
+      lines.push(line);
+    } else if (r.price_type === "override") {
+      lines.push(
+        `- ${r.service_name} ${tag} — UPDATED price: ${r.price} ${r.currency}. price_type=override. This is the CURRENT price (NOT a promotion).`
+      );
+    } else if (r.price_type === "inactive") {
+      lines.push(
+        `- ${r.service_name} ${tag} — UNAVAILABLE. price_type=inactive. Do not offer or book this service.`
+      );
     }
-
-    const promo = bestActivePromotion(promotions, service, today);
-    if (promo) {
-      const p = promotionPrice(promo);
-      if (p) {
-        let line = `- ${name}: ${p.price} ${p.currency} (PROMOTION "${promo.promo_name}"`;
-        const until = normalizeDate(promo.end_date);
-        if (until) line += `, active until ${until}`;
-        line += ")";
-        if (hasValue(promo.gift_description)) line += ` + gift: ${promo.gift_description}`;
-        lines.push(line);
-        continue;
-      }
-    }
-
-    const override = serviceOverridePrice(service);
-    if (override) {
-      lines.push(`- ${name}: ${override.price} ${override.currency} (updated price)`);
-    }
-    // else: no overlay → the knowledge-base price stands; emit nothing.
+    // knowledge_base → omitted; the KB price applies.
   }
 
   if (!lines.length) {
@@ -476,7 +500,7 @@ async function buildPricingContext() {
   }
 
   const block = [
-    "Live pricing overlay from Google Sheets — AUTHORITATIVE over the knowledge base for the items below (promotions, updated prices, availability). For any service NOT listed here, use the price from the knowledge base.",
+    "PRICING OVERLAY — live data from Google Sheets, AUTHORITATIVE over the knowledge base for the services listed here. For any service NOT listed, use the price from the knowledge base.",
     ...lines
   ].join("\n");
 
@@ -503,6 +527,7 @@ module.exports = {
   loadPromotions,
   getCurrentPrice,
   getActivePromotion,
+  getResolvedPricing,
   refreshCache,
   buildPricingContext,
   getCacheStatus

@@ -4063,13 +4063,18 @@ app.get("/debug/knowledge", (req, res) => {
 
 app.get("/debug/prices", async (req, res) => {
   try {
-    const [services, promotions] = await Promise.all([
+    const [services, promotions, resolved] = await Promise.all([
       googleSheetsProvider.loadServices(),
-      googleSheetsProvider.loadPromotions()
+      googleSheetsProvider.loadPromotions(),
+      googleSheetsProvider.getResolvedPricing()
     ]);
     const status = googleSheetsProvider.getCacheStatus();
 
     return res.status(200).json({
+      // Per-service resolved pricing: which service is active, the Sheets
+      // price, whether it is promotional, and where it came from
+      // (promotion / override / inactive / knowledge_base).
+      resolved,
       services,
       promotions,
       source: status.source,
