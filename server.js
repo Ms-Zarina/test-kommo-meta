@@ -3924,7 +3924,7 @@ app.get("/meta/webhook", (req, res) => {
 
   if (mode === "subscribe" && token === verifyToken) {
     console.log("META WEBHOOK VERIFIED");
-    return res.status(200).send(challenge);
+    return res.status(200).type("text/plain").send(String(challenge));
   }
 
   return res.sendStatus(403);
