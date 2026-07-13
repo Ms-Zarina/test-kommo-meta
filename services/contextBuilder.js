@@ -74,10 +74,12 @@ const PROMPT_INSTRUCTIONS = [
 //   - anthropic  → 200K context, the whole base (~46.5k chars ≈ ~20k tokens)
 //     fits easily, so send it all and lose no information.
 //   - openrouter → the FREE tier caps prompt tokens HARD (and the cap shrinks
-//     with use), so the base MUST be trimmed to the most relevant sections or
-//     requests 402 with "Prompt tokens limit exceeded".
-// MAX_KB_CHARS env overrides either default (e.g. raise it if you buy credits).
-const DEFAULT_KB_CHARS = resolveProvider() === "openrouter" ? 13000 : 200000;
+//     with use — observed collapsing to ~5220 prompt tokens), so the base MUST
+//     be trimmed aggressively or requests 402 "Prompt tokens limit exceeded".
+//     ~6000 chars of KB + the fixed instruction block lands near ~4000 tokens,
+//     leaving margin under the 5220 cap. Raise MAX_KB_CHARS once you add credit.
+// MAX_KB_CHARS env overrides either default.
+const DEFAULT_KB_CHARS = resolveProvider() === "openrouter" ? 6000 : 200000;
 const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || DEFAULT_KB_CHARS;
 
 // Split the markdown knowledge base into sections by heading (#, ##, ...).
