@@ -67,10 +67,113 @@ const PROMPT_INSTRUCTIONS = [
   "- When a promotion is active, always show the promotional price first and make clear it is акционная; never hide that it is promotional."
 ];
 
-// eslint-disable-next-line no-unused-vars -- userMessage is reserved for future
-// per-message retrieval (FAQ search, Kommo lead lookup, intent-based context).
+// Max characters of the knowledge base to inject per request. The full base
+// (~46.5k Cyrillic chars ≈ ~20k tokens at ~2.3 chars/token) exceeds the free
+// OpenRouter prompt limit (17327 tokens). We keep the FULL base in
+// knowledge_base.md and send only the sections relevant to the current
+// question, capped to this budget. 26000 chars ≈ ~11k tokens; with the
+// instructions + pricing overlay the whole prompt stays well under the limit.
+const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || 26000;
+
+// Split the markdown knowledge base into sections by heading (#, ##, ...).
+function splitKnowledgeSections(md) {
+  const sections = [];
+  let current = { title: "(intro)", lines: [] };
+  for (const line of String(md).split("\n")) {
+    if (/^#{1,6}\s/.test(line)) {
+      if (current.lines.length) sections.push(current);
+      current = {
+        title: line.replace(/^#{1,6}\s*/, "").replace(/\*+/g, "").trim(),
+        lines: [line]
+      };
+    } else {
+      current.lines.push(line);
+    }
+  }
+  if (current.lines.length) sections.push(current);
+  return sections.map((s) => ({ title: s.title, text: s.lines.join("\n") }));
+}
+
+// Pick the knowledge-base sections most relevant to the user's message, always
+// keeping the general-info section, and stay within MAX_KB_CHARS. If the whole
+// base already fits, it is returned unchanged (no information lost).
+function selectRelevantKnowledge(md, userMessage) {
+  const full = String(md || "");
+  if (full.length <= MAX_KB_CHARS) {
+    return full;
+  }
+
+  const sections = splitKnowledgeSections(full);
+  const terms = String(userMessage || "")
+    .toLowerCase()
+    .split(/[^a-zа-яё0-9]+/i)
+    .filter((w) => w.length >= 3);
+
+  const scoreOf = (text) => {
+    const hay = text.toLowerCase();
+    let s = 0;
+    for (const t of terms) {
+      let idx = hay.indexOf(t);
+      while (idx !== -1) {
+        s += 1;
+        idx = hay.indexOf(t, idx + t.length);
+      }
+    }
+    return s;
+  };
+  const scores = sections.map((s) => scoreOf(s.text));
+
+  // Always include the general clinic info (contacts, hours, booking, rules).
+  let coreIdx = sections.findIndex((s) => /ОБЩАЯ ИНФОРМАЦ/i.test(s.title));
+  if (coreIdx < 0) coreIdx = 0;
+
+  const chosen = new Set([coreIdx]);
+  let size = sections[coreIdx].text.length;
+
+  // Add the highest-scoring relevant sections until the budget is reached.
+  const byScore = sections
+    .map((_, i) => i)
+    .sort((a, b) => scores[b] - scores[a] || a - b);
+  for (const i of byScore) {
+    if (chosen.has(i) || scores[i] === 0) continue;
+    if (size + sections[i].text.length > MAX_KB_CHARS) continue;
+    chosen.add(i);
+    size += sections[i].text.length;
+  }
+
+  // Nothing matched (e.g. greeting / generic) → fill by document order.
+  if (chosen.size === 1) {
+    for (let i = 0; i < sections.length; i += 1) {
+      if (chosen.has(i)) continue;
+      if (size + sections[i].text.length > MAX_KB_CHARS) break;
+      chosen.add(i);
+      size += sections[i].text.length;
+    }
+  }
+
+  const picked = [...chosen]
+    .sort((a, b) => a - b)
+    .map((i) => sections[i].text)
+    .join("\n\n");
+
+  console.log("KNOWLEDGE_SELECTED", {
+    totalSections: sections.length,
+    pickedSections: chosen.size,
+    chars: picked.length,
+    budgetChars: MAX_KB_CHARS
+  });
+  return picked;
+}
+
 async function buildContext(userMessage) {
-  const knowledgeBase = knowledgeProvider.loadKnowledgeBase();
+  const fullKnowledgeBase = knowledgeProvider.loadKnowledgeBase();
+  const hasKnowledgeBase = hasValue(fullKnowledgeBase);
+
+  // Inject only the relevant sections to keep the prompt within the model's
+  // input-token limit. hasKnowledgeBase is based on the FULL base.
+  const knowledgeBase = hasKnowledgeBase
+    ? selectRelevantKnowledge(fullKnowledgeBase, userMessage)
+    : "";
 
   // Pricing overlay is best-effort: any failure must not break the AI.
   let pricingContext = "";
@@ -79,8 +182,6 @@ async function buildContext(userMessage) {
   } catch (error) {
     console.error("GOOGLE_SHEETS_ERROR", { message: error.message });
   }
-
-  const hasKnowledgeBase = hasValue(knowledgeBase);
   const hasPricing = hasValue(pricingContext);
 
   // Assemble the system prompt: instructions + knowledge base + (optional)
