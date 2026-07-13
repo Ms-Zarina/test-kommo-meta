@@ -22,6 +22,7 @@
 
 const knowledgeProvider = require("./knowledgeProvider");
 const googleSheetsProvider = require("./googleSheetsProvider");
+const { resolveProvider } = require("./aiProvider");
 
 function hasValue(value) {
   return value !== null && value !== undefined && String(value).trim() !== "";
@@ -68,13 +69,16 @@ const PROMPT_INSTRUCTIONS = [
   "- When a promotion is active, always show the promotional price first and make clear it is акционная; never hide that it is promotional."
 ];
 
-// Max characters of the knowledge base to inject per request. The direct
-// Anthropic API has a 200K-token context window, so the whole base (~46.5k
-// chars ≈ ~20k tokens) fits easily — default high enough to send it all. The
-// section-selection logic below only kicks in if the base ever grows past this
-// budget (or on a tiny-context provider). Lower MAX_KB_CHARS via env only if
-// you switch to a model/tier with a small prompt-token limit.
-const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || 200000;
+// Max characters of the knowledge base to inject per request. The right budget
+// depends on the provider's realistic prompt-token headroom:
+//   - anthropic  → 200K context, the whole base (~46.5k chars ≈ ~20k tokens)
+//     fits easily, so send it all and lose no information.
+//   - openrouter → the FREE tier caps prompt tokens HARD (and the cap shrinks
+//     with use), so the base MUST be trimmed to the most relevant sections or
+//     requests 402 with "Prompt tokens limit exceeded".
+// MAX_KB_CHARS env overrides either default (e.g. raise it if you buy credits).
+const DEFAULT_KB_CHARS = resolveProvider() === "openrouter" ? 13000 : 200000;
+const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || DEFAULT_KB_CHARS;
 
 // Split the markdown knowledge base into sections by heading (#, ##, ...).
 function splitKnowledgeSections(md) {

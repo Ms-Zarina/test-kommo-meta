@@ -21,7 +21,10 @@
 const axios = require("axios");
 
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-3.5-sonnet";
+// Default to a FREE OpenRouter model so a fresh deploy never accidentally bills
+// (or 402s on a paid model with no credit). Override via OPENROUTER_MODEL.
+const OPENROUTER_MODEL =
+  process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free";
 const FALLBACK_MESSAGE =
   "Спасибо за сообщение. Наш специалист скоро свяжется с вами.";
 
@@ -174,4 +177,4 @@ async function generateReply({ context = {}, userMessage } = {}) {
   }
 }
 
-module.exports = { generateReply, FALLBACK_MESSAGE };
+module.exports = { generateReply, FALLBACK_MESSAGE, resolveProvider };
