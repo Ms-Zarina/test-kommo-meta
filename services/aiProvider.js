@@ -154,7 +154,18 @@ async function generateReply({ context = {}, userMessage } = {}) {
       status: error.response?.status,
       data: error.response?.data
     });
-    return { text: FALLBACK_MESSAGE, source: "fallback_ai_error" };
+    // TEMPORARY: expose the upstream error so /debug/ai can show the real cause.
+    return {
+      text: FALLBACK_MESSAGE,
+      source: "fallback_ai_error",
+      error: {
+        provider,
+        model: provider === "openrouter" ? OPENROUTER_MODEL : ANTHROPIC_MODEL,
+        status: error.response?.status || null,
+        message: error.message,
+        detail: error.response?.data || null
+      }
+    };
   }
 }
 

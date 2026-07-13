@@ -4109,6 +4109,7 @@ app.get("/debug/ai", async (req, res) => {
     message: String(message),
     reply: reply.text,
     source: reply.source,
+    error: reply.error || null,
     pricing_source: googleSheetsProvider.getCacheStatus().source
   });
 });
