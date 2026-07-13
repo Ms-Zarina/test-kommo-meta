@@ -68,14 +68,13 @@ const PROMPT_INSTRUCTIONS = [
   "- When a promotion is active, always show the promotional price first and make clear it is акционная; never hide that it is promotional."
 ];
 
-// Max characters of the knowledge base to inject per request. The free
-// OpenRouter tier caps the prompt at a LOW, VARIABLE limit (seen 17327, then
-// 9583 tokens). We keep the FULL base in knowledge_base.md and send only the
-// sections relevant to the current question, capped to this budget.
-// 13000 Cyrillic chars ≈ ~5.5k tokens; with instructions + pricing overlay the
-// whole prompt stays ~6.5k tokens, under the current free-tier limit.
-// Tune without a code deploy via the MAX_KB_CHARS env var if the limit changes.
-const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || 13000;
+// Max characters of the knowledge base to inject per request. The direct
+// Anthropic API has a 200K-token context window, so the whole base (~46.5k
+// chars ≈ ~20k tokens) fits easily — default high enough to send it all. The
+// section-selection logic below only kicks in if the base ever grows past this
+// budget (or on a tiny-context provider). Lower MAX_KB_CHARS via env only if
+// you switch to a model/tier with a small prompt-token limit.
+const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || 200000;
 
 // Split the markdown knowledge base into sections by heading (#, ##, ...).
 function splitKnowledgeSections(md) {

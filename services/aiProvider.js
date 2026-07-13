@@ -20,7 +20,7 @@
 
 const axios = require("axios");
 
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-3.5-sonnet";
 const FALLBACK_MESSAGE =
   "Спасибо за сообщение. Наш специалист скоро свяжется с вами.";
@@ -35,6 +35,11 @@ function resolveProvider() {
   const explicit = String(process.env.AI_PROVIDER || "").trim().toLowerCase();
   if (explicit === "openrouter" || explicit === "anthropic") {
     return explicit;
+  }
+  // Auto-detect: prefer the direct Anthropic API when its key is present
+  // (no prompt-token cap), fall back to OpenRouter, default to Anthropic.
+  if (hasValue(process.env.ANTHROPIC_API_KEY)) {
+    return "anthropic";
   }
   if (hasValue(process.env.OPENROUTER_API_KEY)) {
     return "openrouter";
