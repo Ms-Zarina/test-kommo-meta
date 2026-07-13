@@ -67,13 +67,14 @@ const PROMPT_INSTRUCTIONS = [
   "- When a promotion is active, always show the promotional price first and make clear it is акционная; never hide that it is promotional."
 ];
 
-// Max characters of the knowledge base to inject per request. The full base
-// (~46.5k Cyrillic chars ≈ ~20k tokens at ~2.3 chars/token) exceeds the free
-// OpenRouter prompt limit (17327 tokens). We keep the FULL base in
-// knowledge_base.md and send only the sections relevant to the current
-// question, capped to this budget. 26000 chars ≈ ~11k tokens; with the
-// instructions + pricing overlay the whole prompt stays well under the limit.
-const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || 26000;
+// Max characters of the knowledge base to inject per request. The free
+// OpenRouter tier caps the prompt at a LOW, VARIABLE limit (seen 17327, then
+// 9583 tokens). We keep the FULL base in knowledge_base.md and send only the
+// sections relevant to the current question, capped to this budget.
+// 13000 Cyrillic chars ≈ ~5.5k tokens; with instructions + pricing overlay the
+// whole prompt stays ~6.5k tokens, under the current free-tier limit.
+// Tune without a code deploy via the MAX_KB_CHARS env var if the limit changes.
+const MAX_KB_CHARS = Number(process.env.MAX_KB_CHARS) || 13000;
 
 // Split the markdown knowledge base into sections by heading (#, ##, ...).
 function splitKnowledgeSections(md) {
@@ -94,6 +95,15 @@ function splitKnowledgeSections(md) {
   return sections.map((s) => ({ title: s.title, text: s.lines.join("\n") }));
 }
 
+// Normalize text for keyword matching: lowercase, unify the CO₂/CO² subscript
+// with the ASCII "CO2" users type, and drop markdown markers.
+function normalizeForMatch(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[₂²]/g, "2")
+    .replace(/[*#]/g, " ");
+}
+
 // Pick the knowledge-base sections most relevant to the user's message, always
 // keeping the general-info section, and stay within MAX_KB_CHARS. If the whole
 // base already fits, it is returned unchanged (no information lost).
@@ -104,24 +114,28 @@ function selectRelevantKnowledge(md, userMessage) {
   }
 
   const sections = splitKnowledgeSections(full);
-  const terms = String(userMessage || "")
-    .toLowerCase()
+  const terms = normalizeForMatch(userMessage)
     .split(/[^a-zа-яё0-9]+/i)
     .filter((w) => w.length >= 3);
 
-  const scoreOf = (text) => {
-    const hay = text.toLowerCase();
+  // Count term hits in the body; a hit in the heading is a much stronger
+  // signal, so it is weighted heavily.
+  const scoreOf = (section) => {
+    if (!terms.length) return 0;
+    const body = normalizeForMatch(section.text);
+    const title = normalizeForMatch(section.title);
     let s = 0;
     for (const t of terms) {
-      let idx = hay.indexOf(t);
+      let idx = body.indexOf(t);
       while (idx !== -1) {
         s += 1;
-        idx = hay.indexOf(t, idx + t.length);
+        idx = body.indexOf(t, idx + t.length);
       }
+      if (title.includes(t)) s += 8;
     }
     return s;
   };
-  const scores = sections.map((s) => scoreOf(s.text));
+  const scores = sections.map((section) => scoreOf(section));
 
   // Always include the general clinic info (contacts, hours, booking, rules).
   let coreIdx = sections.findIndex((s) => /ОБЩАЯ ИНФОРМАЦ/i.test(s.title));
