@@ -3949,6 +3949,51 @@ app.get("/meta/webhook", (req, res) => {
 
 const IG_GRAPH_VERSION = process.env.IG_GRAPH_VERSION || "v25.0";
 
+// Instagram Direct rejects text messages longer than 1000 characters. Split a
+// long reply into parts (preferring paragraph, then sentence boundaries) so the
+// whole answer is delivered as a few sequential messages.
+function splitMessageForInstagram(text, max = 950) {
+  const clean = String(text || "").trim();
+  if (clean.length <= max) return clean ? [clean] : [];
+
+  const chunks = [];
+  let buf = "";
+  const flush = () => {
+    if (buf.trim()) chunks.push(buf.trim());
+    buf = "";
+  };
+
+  for (const para of clean.split(/\n{2,}/)) {
+    const block = para.trim();
+    if (!block) continue;
+    if ((buf ? buf.length + 2 : 0) + block.length <= max) {
+      buf = buf ? `${buf}\n\n${block}` : block;
+      continue;
+    }
+    flush();
+    if (block.length <= max) {
+      buf = block;
+      continue;
+    }
+    // Paragraph itself too long → split by sentences, then hard-cut.
+    for (const sentence of block.match(/[^.!?\n]+[.!?]*\s*/g) || [block]) {
+      const s = sentence.trim();
+      if (!s) continue;
+      if ((buf ? buf.length + 1 : 0) + s.length <= max) {
+        buf = buf ? `${buf} ${s}` : s;
+      } else {
+        flush();
+        if (s.length <= max) buf = s;
+        else {
+          for (let i = 0; i < s.length; i += max) chunks.push(s.slice(i, i + max));
+        }
+      }
+    }
+  }
+  flush();
+  return chunks;
+}
+
 async function sendInstagramMessage(recipientId, text) {
   const token = process.env.IG_PAGE_ACCESS_TOKEN;
 
@@ -3967,25 +4012,31 @@ async function sendInstagramMessage(recipientId, text) {
   }
 
   const url = `https://graph.instagram.com/${IG_GRAPH_VERSION}/me/messages`;
+  const parts = splitMessageForInstagram(text, 950);
 
   try {
-    const response = await axios.post(
-      url,
-      {
-        recipient: { id: recipientId },
-        message: { text: String(text) }
-      },
-      {
-        params: { access_token: token },
-        timeout: 15000
-      }
-    );
+    let lastData = null;
+    for (const part of parts) {
+      const response = await axios.post(
+        url,
+        {
+          recipient: { id: recipientId },
+          message: { text: part }
+        },
+        {
+          params: { access_token: token },
+          timeout: 15000
+        }
+      );
+      lastData = response.data;
+    }
 
     console.log("IG_REPLY_SENT", {
       recipientId,
-      messageId: response.data?.message_id || null
+      parts: parts.length,
+      messageId: lastData?.message_id || null
     });
-    return { sent: true, data: response.data };
+    return { sent: true, data: lastData };
   } catch (error) {
     console.error("IG_REPLY_ERROR", {
       recipientId,
